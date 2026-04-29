@@ -77,7 +77,7 @@ impl ChatTemplateProcessor for AutoChatTemplate {
             let system_msg = serde_json::json!({
                 "role": "system",
                 "content": format!(
-                    "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <|tool_start|>...</|tool_end|> XML tags:\n<|tool_start|\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n<|tool_end|>",
+                    "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <|tool_start|>...<|tool_end|> XML tags.\n\nExample:\n<|tool_start|>\n{{\"name\": \"get_time\", \"arguments\": \"{{}}\"}}\n<|tool_end|>",
                     tools_json
                 )
             });

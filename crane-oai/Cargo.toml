@@ -17,6 +17,7 @@ async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+regex = "1.12.3"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 candle-core = { git = "https://github.com/huggingface/candle", rev = "5447a87" }
 candle-nn = { git = "https://github.com/huggingface/candle", rev = "5447a87", features = ["metal"] }

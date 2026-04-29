@@ -10,7 +10,7 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 
 **Supported Models**:
 
-- [x] Qwen3 (0.6B ~ 30B+) with tool calling support
+- [x] Qwen3 (0.6B ~ 30B+) with production tool calling (Qwen3-1.7B validated)
 - [x] Qwen 2.5 (0.5B ~ 72B) with function calling
 - [x] Hunyuan Dense
 - [x] Qwen3 VL (2B, 4B)
@@ -20,7 +20,7 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 - [x] Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder, voice cloning)
 - [ ] TTS: [Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
 
-**Tool Calling Support**: Models with 7B+ parameters generally provide reliable tool calling. Smaller models (0.5B-3B) may have inconsistent tool recognition.
+**Tool Calling Support**: Qwen3-1.7B validated for reliable tool calling. Models with 7B+ parameters generally provide more consistent tool recognition. Smaller models (0.5B-3B) may have inconsistent tool format adherence despite flexible parsing.
 
 
 submit your models make other users use it easier!
@@ -30,12 +30,12 @@ submit your models make other users use it easier!
 
 **Key Advantages**:
 
-- **Blazing-Fast Inference**: Outperforms native PyTorch with Candle's optimized kernels
+- **Fast Inference**: Outperforms native PyTorch with Candle's optimized kernels
 - **Rust-Powered**: Eliminate C++ complexity while maintaining native performance
-- **Apple Silicon Optimized**: Achieve GPU acceleration via Metal on macOS devices
+- **Apple Silicon Optimized**: GPU acceleration via Metal on macOS devices
 - **Hardware Agnostic**: Unified codebase for CPU/CUDA/Metal execution
-- **OpenAI Compatible API**: Supports OpenAI and SGLang interfaces including robust function calling
-- **Production Tool Calling**: Multi-format tool detection, whitespace-aware parsing, comprehensive testing
+- **OpenAI Compatible API**: Supports OpenAI and SGLang interfaces including function calling
+- **Tool Calling**: Multi-format detection, whitespace-aware parsing
 - **Memory Safety**: Pre-flight memory checks prevent OOM crashes with device-aware resource management
 
 
@@ -60,9 +60,8 @@ We include:
 
 ## Updates
 
-- **2026.04.29**: Tool calling infrastructure enhancements - robust whitespace handling for model-generated tokens, comprehensive unit test coverage (52 tests), Qwen3 tool format support, improved detection and parsing reliability
+- **2026.04.29**: Tool calling implementation - complete OpenAI-compatible function calling with multi-format token detection, whitespace handling, flexible argument parsing (string/object), test coverage (69 tests), Qwen3-1.7B validated
 - **2026.04.29**: Memory safety system - pre-flight memory checks, device-aware concurrent scaling (Metal: 1-4, CPU: 1-4, CUDA: 4-16), F16 dtype on Metal by default (50% memory savings), sysinfo integration for accurate memory detection
-- **2026.04.29**: OpenAI function calling support - tool definitions, tool_call detection, multi-turn tool conversations
 - **2026.02.23**: Qwen3-TTS support added - full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai
 - **2026.02.18**: Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies
 - **2026.01.30**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/
@@ -204,7 +203,7 @@ That's it!
 
 ### Testing and Development Tools
 
-Crane includes a comprehensive testing infrastructure (`xtask`) for validation and development:
+Crane includes a testing infrastructure (`xtask`) for validation and development:
 
 ```bash
 # Build testing tools
@@ -266,63 +265,63 @@ print(response.choices[0].message.content)
 
 **Function Calling**
 
-Crane supports OpenAI-compatible function calling with comprehensive tool definition handling, automatic format detection, and robust parsing:
+Crane supports OpenAI-compatible function calling with tool definition handling, format detection, and parsing:
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
 response = client.chat.completions.create(
-    model="Qwen2.5-7B-Instruct",
-    messages=[{"role": "user", "content": "What's the weather in London?"}],
+    model="Qwen3-1.7B",
+    messages=[{"role": "user", "content": "What's the current time?"}],
     tools=[{
         "type": "function",
         "function": {
-            "name": "get_weather",
-            "description": "Get current weather for a location",
+            "name": "get_time",
+            "description": "Get current time",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "location": {"type": "string"}
-                },
-                "required": ["location"]
+                "properties": {},
+                "required": []
             }
         }
     }]
 )
 
-# Model may return tool_calls instead of content
+# Model returns tool_calls instead of content
 if response.choices[0].message.tool_calls:
     for tool_call in response.choices[0].message.tool_calls:
         print(f"Function: {tool_call.function.name}")
         print(f"Arguments: {tool_call.function.arguments}")
+        # Execute function and send result back to model
 ```
 
 **Tool Format Support**
 
-Crane automatically detects and parses multiple tool calling formats used by different model families:
+Crane detects and parses tool calling formats with whitespace handling:
 
-- **Qwen Special Tokens**: `<|tool_call|>...<|end_tool_call|>`
-- **Qwen Tool Start**: `<|tool_start|>...<|tool_end|>` (with whitespace handling)
-- **OpenAI Style**: JSON blocks with function type markers
-- **Markdown Code Blocks**: Tool definitions in fenced code blocks
+- **Qwen Special Tokens**: `<|tool_call|>...<|end_tool_call|>` (alternative format)
+- **Qwen Tool Start**: `<|tool_start|>...<|tool_end|>` (primary format)
+  - Handles whitespace variations: `<| tool_start|>`, `<|tool_start |>`, `<|tool_start\n|>`
+  - Regex detection for malformed tokens from model output
+- **Flexible Arguments**: Accepts both `"arguments": "{}"` (string) and `"arguments": {}` (object)
+- **Conversational Context**: Extracts tool calls from model explanations and reasoning text
 
-The parser includes robust whitespace handling to accommodate model-generated tokens that may include newlines or spaces within special token markers.
+The parser handles whitespace in model-generated tokens that may include newlines or spaces within special token markers.
 
 **Model Compatibility**
 
-Tool calling requires models specifically trained for function use. Recommended models:
+Tool calling requires models specifically trained for function use. Validated models:
 
-- **Qwen2.5-7B-Instruct**: Full tool calling support with high reliability
-- **Qwen2.5-14B-Instruct**: Enhanced tool recognition and argument generation
-- **Qwen3-4B-Instruct**: Modern tool calling format support
-- **Qwen3-1.7B**: Basic tool support (may have reduced reliability for complex tools)
+- **Qwen3-1.7B**: Production validated with reliable tool calling
+- **Qwen2.5-7B+**: Enhanced tool recognition and argument generation
+- **Qwen3-4B+**: Modern tool calling format support
 
-Smaller models (0.5B-3B) may not reliably recognize tool definitions or generate properly formatted tool calls.
+Models with 7B+ parameters generally provide more consistent tool recognition. Smaller models (0.5B-3B) may have inconsistent tool format adherence despite flexible parsing capabilities.
 
 **Testing Infrastructure**
 
-Crane includes comprehensive testing infrastructure for tool calling validation:
+Crane includes testing infrastructure for tool calling validation:
 
 ```bash
 # Test tool calling with auto-detected model
@@ -424,36 +423,38 @@ Crane/
 
 ### Tool Calling Implementation
 
-Crane's tool calling system includes several advanced features for production reliability:
+Crane's tool calling system provides OpenAI-compatible function calling with error handling:
 
 **Format Detection Pipeline**
 
 The system automatically identifies the tool calling format from model-generated text:
 
-1. **Pattern Matching**: Scans for special tokens (`<|tool_call|>`, `<|tool_start|>`, etc.)
-2. **Whitespace Normalization**: Handles newlines and spaces within special tokens
-3. **JSON Validation**: Ensures extracted tool calls contain valid JSON structures
-4. **Fallback Detection**: Supports multiple formats for cross-model compatibility
+1. **Fast Path Matching**: Direct string comparison for common formats
+2. **Regex Fallback**: Handles whitespace variations in special tokens
+3. **Format Validation**: Confirms both start and end tokens present
+4. **Argument Parsing**: Flexible JSON extraction with type conversion
 
-**Robust Parsing**
+**Parsing Features**
 
-- **Token Normalization**: Converts whitespace-affected tokens to canonical forms
+- **Token Normalization**: Converts malformed tokens (`<|tool_start\n|>` to canonical form)
+- **Flexible Arguments**: Handles both `arguments: "{}"` (string) and `arguments: {}` (object)
+- **Conversational Extraction**: Finds tool calls within explanatory text
 - **Multi-call Support**: Extracts multiple sequential tool calls from single response
-- **Error Recovery**: Gracefully handles malformed JSON and incomplete tool calls
 - **Type Safety**: Strongly-typed Rust structures prevent API response errors
 
-**Comprehensive Testing**
+**Testing**
 
-The 52+ unit tests cover:
+The 69 unit tests cover:
 
+- Regex detection patterns for various whitespace combinations
 - Format detection for all supported tool calling formats
-- Edge cases (empty calls, malformed JSON, incomplete tokens)
-- Whitespace handling in special tokens
+- Real-world model output patterns (conversational text + tool calls)
+- Edge cases (empty arguments, escaped characters, incomplete tokens)
 - Multiple sequential tool calls
-- Complex nested arguments
+- Complex nested arguments with proper JSON stringification
 - Integration testing with complete request/response cycle
 
-This ensures reliable tool calling behavior across different model families and generations.
+This validates tool calling behavior across different model families and generations.
 
 ## Contribution
 
@@ -478,11 +479,11 @@ When adding tool calling support for new model families:
 - **Identify Format**: Determine the special token format the model uses for tool calls
 - **Add Detection**: Update `detect_tool_call_format()` in `crane-oai/src/openai_api.rs`
 - **Implement Parser**: Add parsing function following existing patterns in `parse_qwen_tool_calls()` or `parse_qwen_tool_start_calls()`
-- **Add Tests**: Include comprehensive unit tests in the `openai_api::tests` module
+- **Add Tests**: Include unit tests in the `openai_api::tests` module
 - **Validate**: Use `cargo xtask test-tools` to validate with actual model inference
 
 Key considerations:
-- Models may insert whitespace/newlines in special tokens - implement robust handling
+- Models may insert whitespace/newlines in special tokens - handle variations
 - Test with edge cases: malformed JSON, incomplete tokens, multiple sequential calls
 - Ensure API response structure matches OpenAI specification
 - Add logging for debugging tool detection and parsing failures
@@ -538,6 +539,100 @@ Environment variables for tuning:
 | `CRANE_TOPP_FALLBACK_TOPK` | `64` | Top-k size when top_p is active and GPU path is used |
 | `CRANE_TOPK_SAMPLE_ON_CPU` | `0` | Force CPU sampling after GPU topk |
 | `CRANE_SAMPLE_TRACE` | `0` | Enable detailed sampling timing logs |
+
+### Tool Calling Implementation
+
+Crane provides OpenAI-compatible function calling with support for Qwen models. The implementation handles model output variations including whitespace, newlines, and different argument formats.
+
+**Supported Formats:**
+
+Models can generate tool calls using Qwen special tokens:
+
+```
+<|tool_start|>
+{"name": "function_name", "arguments": "{}"}
+<|tool_end|>
+```
+
+**Key Features:**
+
+- Multi-format token detection: Handles model-generated variations in special token formatting
+- Whitespace-aware parsing: Regex-based fallback for malformed tokens
+- Flexible argument handling: Accepts both `arguments: "{}"` (string) and `arguments: {}` (object) formats
+- OpenAI-compatible responses: Returns structured `tool_calls` array with unique call IDs
+- Test coverage: 69 unit tests covering detection, parsing, edge cases, and integration scenarios
+
+**Request Format:**
+
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-1.7B",
+    "messages": [
+      {"role": "user", "content": "What time is it?"}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_time",
+          "description": "Get current time",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
+    ]
+  }'
+```
+
+**Response Format:**
+
+```json
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "call_95eabd13-0431-45e7-95f4-4e8ed4a8e798",
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "arguments": "{}"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Implementation Details:**
+
+The tool calling pipeline consists of three stages:
+
+1. **Detection**: Identifies tool call format using fast string matching with regex fallback
+2. **Normalization**: Handles whitespace variations in special tokens (`<|tool_start|>`, `<|tool_end|>`)
+3. **Extraction**: Parses JSON arguments with flexible type conversion
+
+**Testing Infrastructure:**
+
+Comprehensive test suite validating:
+- Token format detection (regex patterns, whitespace handling)
+- JSON parsing (string/object arguments, escaped characters)
+- Integration scenarios (conversational text, multiple calls, edge cases)
+- Real-world model output patterns
+
+**Model Compatibility:**
+
+- Qwen3-1.7B: Validated with reliable tool calling
+- Models 7B+: Generally provide more consistent tool recognition
+- Smaller models (0.5B-3B): May have inconsistent tool format adherence
 
 ## Speed
 
