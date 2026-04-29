@@ -44,7 +44,7 @@ impl ChatTemplateProcessor for AutoChatTemplate {
               tools.map_or(0, |t| t.len()));
 
         // Build the list of {role, content} values expected by the Jinja template.
-        let template_messages: Vec<serde_json::Value> = messages
+        let mut template_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
                 let mut msg = serde_json::json!({
@@ -65,50 +65,33 @@ impl ChatTemplateProcessor for AutoChatTemplate {
             })
             .collect::<Result<Vec<_>, String>>()?;
 
-        // Strategy: Try tool context first, fall back to messages-only if it fails
-        // This handles both tool-capable and non-tool templates gracefully
+        // For tools, prepend a system message with tool definitions
+        // This matches how HuggingFace transformers does it
         if let Some(tools) = tools {
             info!("Processing {} tools for template", tools.len());
 
-            // Try tool-enabled context first
-            let context = serde_json::json!({
-                "messages": template_messages,
-                "tools": tools
+            // Create system message with tool definitions
+            let tools_json = serde_json::to_string_pretty(tools)
+                .unwrap_or_else(|_| "[]".to_string());
+
+            let system_msg = serde_json::json!({
+                "role": "system",
+                "content": format!(
+                    "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <|tool_start|>...</|tool_end|> XML tags:\n<|tool_start|\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n<|tool_end|>",
+                    tools_json
+                )
             });
 
-            debug!("Tool context attempt: {}", serde_json::to_string_pretty(&context).unwrap_or_else(|_| "Invalid".to_string()));
+            // Insert system message at the beginning
+            let mut messages_with_tools = vec![system_msg];
+            messages_with_tools.extend(template_messages);
 
-            // Try tool context first
-            let tool_result = self.tokenizer.apply_chat_template(&context, true);
-            if let Ok(formatted) = tool_result {
-                info!("Tool context template succeeded");
-                return Ok(formatted);
-            }
+            debug!("Messages with tool system message: {} total messages", messages_with_tools.len());
+            debug!("First message (tools): {}", serde_json::to_string_pretty(&messages_with_tools[0]).unwrap_or_else(|_| "Invalid".to_string()));
 
-            warn!("Tool context template failed: {:?}", tool_result);
-            info!("Falling back to adding tools to first message");
-
-            // Fallback: Add tools to first message (some templates expect this)
-            let mut fallback_messages = template_messages.clone();
-            if let Some(first_msg) = fallback_messages.first_mut() {
-                if let Ok(tools_value) = serde_json::to_value(tools) {
-                    first_msg["tools"] = tools_value;
-                    debug!("Fallback: tools added to first message");
-                }
-            }
-
-            match self.tokenizer.apply_chat_template(&fallback_messages, true) {
-                Ok(formatted) => {
-                    info!("Fallback template succeeded");
-                    return Ok(formatted);
-                }
-                Err(e) => {
-                    error!("Both tool and fallback templates failed");
-                    error!("Tool context error: {:?}", tool_result);
-                    error!("Fallback error: {:?}", e);
-                    return Err(format!("Chat template error: {e}"));
-                }
-            }
+            return self.tokenizer
+                .apply_chat_template(&messages_with_tools, true)
+                .map_err(|e| format!("Chat template error: {e}"));
         }
 
         // No tools - pass messages directly

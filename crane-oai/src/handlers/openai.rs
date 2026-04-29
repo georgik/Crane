@@ -110,7 +110,14 @@ pub async fn chat_completions(
         // Check if model generated tool calls
         use crate::openai_api::extract_tool_calls;
 
+        debug!("Checking for tool calls in generated text ({} chars)", full_text.len());
+        debug!("Generated text preview: {}", &full_text.chars().take(200).collect::<String>());
+
         let response = if let Some(tool_calls) = extract_tool_calls(&full_text) {
+            info!("Tool calls detected: {} calls", tool_calls.len());
+            debug!("Tool calls: {:?}", tool_calls);
+
+            // Model generated tool call(s)
             // Model generated tool call(s)
             ChatCompletionResponse {
                 id: request_id,
