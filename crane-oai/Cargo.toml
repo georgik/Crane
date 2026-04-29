@@ -21,7 +21,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 candle-core = { git = "https://github.com/huggingface/candle", rev = "5447a87" }
 candle-nn = { git = "https://github.com/huggingface/candle", rev = "5447a87", features = ["metal"] }
 candle-transformers = { git = "https://github.com/huggingface/candle", rev = "5447a87" }
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 tempfile = "3"
 hound = "3.5.1"
 sysinfo = "0.33"

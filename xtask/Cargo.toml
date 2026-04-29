@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.102"
+reqwest = { version = "0.13.3", features = ["json", "blocking"] }
+serde_json = "1.0.149"
+tokio = { version = "1.52.1", features = ["full"] }
