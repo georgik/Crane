@@ -46,7 +46,7 @@ pub async fn chat_completions(
     // Apply chat template.
     let formatted = state
         .chat_template
-        .apply(&req.messages)
+        .apply(&req.messages, req.tools.as_deref())
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}")))?;
 
     // Tokenize.
@@ -91,25 +91,57 @@ pub async fn chat_completions(
         let (full_text, prompt_tokens, completion_tokens, finish_reason) =
             collect_response(response_rx).await?;
 
-        let response = ChatCompletionResponse {
-            id: request_id,
-            object: "chat.completion".into(),
-            created: now_epoch(),
-            model: state.model_name.clone(),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatMessage {
-                    role: "assistant".into(),
-                    content: ChatMessageContent::Text(full_text),
+        // Check if model generated tool calls
+        use crate::openai_api::extract_tool_calls;
+
+        let response = if let Some(tool_calls) = extract_tool_calls(&full_text) {
+            // Model generated tool call(s)
+            ChatCompletionResponse {
+                id: request_id,
+                object: "chat.completion".into(),
+                created: now_epoch(),
+                model: state.model_name.clone(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: ChatMessage {
+                        role: "assistant".into(),
+                        content: None, // No text content when calling tools
+                        tool_calls: Some(tool_calls),
+                        tool_call_id: None,
+                    },
+                    finish_reason: Some(finish_reason),
+                }],
+                usage: Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
                 },
-                finish_reason: Some(finish_reason),
-            }],
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-            },
+            }
+        } else {
+            // Normal text response
+            ChatCompletionResponse {
+                id: request_id,
+                object: "chat.completion".into(),
+                created: now_epoch(),
+                model: state.model_name.clone(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: ChatMessage {
+                        role: "assistant".into(),
+                        content: Some(ChatMessageContent::Text(full_text)),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    finish_reason: Some(finish_reason),
+                }],
+                usage: Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                },
+            }
         };
+
         Ok(Json(response).into_response())
     }
 }
@@ -238,7 +270,7 @@ pub async fn tokenize(
         // Apply chat template first.
         state
             .chat_template
-            .apply(messages)
+            .apply(messages, None)
             .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}")))?
     } else if let Some(text) = &req.text {
         text.clone()

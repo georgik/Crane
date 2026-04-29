@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 crane = { path = "../crane" }
 crane-core = { path = "../crane-core" }
+candle-core = { git = "https://github.com/huggingface/candle", rev = "5447a87" }
 anyhow = "1.0.100"
 image = "0.25.9"
 
@@ -53,8 +54,11 @@ path = "src/gemma4_simple.rs"
 name = "hunyuan_simple"
 path = "src/hunyuan_simple.rs"
 
+[[bin]]
+name = "debug_storage"
+path = "src/debug_storage.rs"
+
 [features]
 default = []
-onnx = ["crane/onnx"]
+# onnx = ["crane/onnx"]  # candle-onnx not currently used
 cuda = ["crane-core/cuda"]
-

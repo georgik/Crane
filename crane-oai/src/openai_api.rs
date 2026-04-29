@@ -49,12 +49,21 @@ pub struct ChatCompletionRequest {
     pub n: Option<usize>,
     /// Response format constraint (e.g., `{"type": "json_object"}`).
     pub response_format: Option<ResponseFormat>,
+    /// Tools/functions that the model may call.
+    pub tools: Option<Vec<Tool>>,
+    /// Controls which tools to use.
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: ChatMessageContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<ChatMessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -62,35 +71,41 @@ impl ChatMessage {
     /// For multimodal messages, concatenates all text parts.
     pub fn text_content(&self) -> String {
         match &self.content {
-            ChatMessageContent::Text(s) => s.clone(),
-            ChatMessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
+            Some(content) => match content {
+                ChatMessageContent::Text(s) => s.clone(),
+                ChatMessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            },
+            None => String::new(),
         }
     }
 
     /// Extract image URLs from multimodal content.
     pub fn image_urls(&self) -> Vec<String> {
         match &self.content {
-            ChatMessageContent::Text(_) => vec![],
-            ChatMessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
-                    _ => None,
-                })
-                .collect(),
+            Some(content) => match content {
+                ChatMessageContent::Text(_) => vec![],
+                ChatMessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            },
+            None => vec![],
         }
     }
 }
 
 /// Chat message content — either a plain string or structured multimodal parts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ChatMessageContent {
     /// Plain text content (backward compatible).
@@ -100,7 +115,7 @@ pub enum ChatMessageContent {
 }
 
 /// A single content part in a multimodal message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     /// Text content.
@@ -115,7 +130,7 @@ pub enum ContentPart {
 }
 
 /// An image URL reference.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImageUrl {
     pub url: String,
 }
@@ -130,6 +145,164 @@ pub struct StreamOptions {
 #[allow(dead_code)]
 pub struct ResponseFormat {
     pub r#type: String,
+}
+
+// ── Tool/Function Calling types ──
+
+/// Tool definition for function calling.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tool {
+    pub r#type: String,
+    pub function: FunctionDefinition,
+}
+
+/// Function definition within a tool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Option<serde_json::Value>,
+    #[serde(rename = "strict")]
+    pub strict_mode: Option<bool>,
+}
+
+/// Tool choice strategy.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    String(String),
+    Specific { r#type: String, function: FunctionName },
+}
+
+impl ToolChoice {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ToolChoice::String(s) if s == "auto")
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, ToolChoice::String(s) if s == "none")
+    }
+
+    pub fn is_required(&self) -> bool {
+        matches!(self, ToolChoice::String(s) if s == "required")
+    }
+}
+
+/// Function name for specific tool choice.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionName {
+    pub name: String,
+}
+
+/// Tool call generated by the model.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub r#type: String,
+    pub function: FunctionCall,
+}
+
+/// Function call within a tool call.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+// ── Tool Call Detection & Parsing ──
+
+/// Format of tool calls in model output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallFormat {
+    /// Qwen special tokens: <|tool_call|>...<|end_tool_call|>
+    QwenSpecialTokens,
+    /// OpenAI-style JSON blocks
+    OpenAIStyle,
+    /// Markdown code blocks
+    MarkdownCodeBlock,
+    /// No tool calls detected
+    None,
+}
+
+/// Detect the format of tool calls in the model output.
+pub fn detect_tool_call_format(text: &str) -> ToolCallFormat {
+    if text.contains("<|tool_call|>") {
+        ToolCallFormat::QwenSpecialTokens
+    } else if text.contains("```json") && text.contains("\"type\": \"function\"") {
+        ToolCallFormat::OpenAIStyle
+    } else if text.contains("```") && (text.contains("function_call") || text.contains("\"name\":")) {
+        ToolCallFormat::MarkdownCodeBlock
+    } else {
+        ToolCallFormat::None
+    }
+}
+
+/// Extract tool calls from model-generated text.
+pub fn extract_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let format = detect_tool_call_format(text);
+
+    match format {
+        ToolCallFormat::QwenSpecialTokens => parse_qwen_tool_calls(text),
+        ToolCallFormat::OpenAIStyle => parse_openai_style_tool_calls(text),
+        ToolCallFormat::MarkdownCodeBlock => parse_markdown_tool_calls(text),
+        ToolCallFormat::None => None,
+    }
+}
+
+/// Parse Qwen-style tool calls: <|tool_call|>{"name": "...", "arguments": "..."}<|end_tool_call|>
+fn parse_qwen_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+
+    let mut start = 0;
+    while let Some(call_start) = text[start..].find("<|tool_call|>") {
+        let absolute_start = start + call_start + "<|tool_call|>".len();
+        let call_text = &text[absolute_start..];
+
+        if let Some(call_end) = call_text.find("<|end_tool_call|>") {
+            let json_str = &call_text[..call_end].trim();
+
+            // Try to parse as JSON
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let (Some(name), Some(args)) = (
+                    value.get("name").and_then(|v| v.as_str()),
+                    value.get("arguments").and_then(|v| v.as_str()),
+                ) {
+                    calls.push(ToolCall {
+                        id: format!("call_{}", uuid::Uuid::new_v4()),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: name.to_string(),
+                            arguments: args.to_string(),
+                        },
+                    });
+                }
+            }
+
+            start = absolute_start + call_end + "<|end_tool_call|>".len();
+        } else {
+            break;
+        }
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+/// Parse OpenAI-style JSON blocks.
+fn parse_openai_style_tool_calls(_text: &str) -> Option<Vec<ToolCall>> {
+    // TODO: Implement OpenAI-style parsing
+    // This would look for JSON blocks with "type": "function"
+    None
+}
+
+/// Parse tool calls from markdown code blocks.
+fn parse_markdown_tool_calls(_text: &str) -> Option<Vec<ToolCall>> {
+    // TODO: Implement markdown parsing
+    // This would look for ```json blocks with function calls
+    None
 }
 
 // ── Response ──
@@ -448,18 +621,132 @@ mod tests {
         assert_eq!(v.as_string(), "foobar");
     }
 
+    // ── Tool/Function Calling types ──
+
+    #[test]
+    fn test_tool_deserialization() {
+        let json = r#"{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    },
+                    "required": ["location"]
+                }
+            }
+        }"#;
+        let tool: Tool = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.r#type, "function");
+        assert_eq!(tool.function.name, "get_weather");
+        assert_eq!(tool.function.description, Some("Get current weather".to_string()));
+    }
+
+    #[test]
+    fn test_tool_choice_auto() {
+        let json = r#""auto""#;
+        let choice: ToolChoice = serde_json::from_str(json).unwrap();
+        assert!(choice.is_auto());
+    }
+
+    #[test]
+    fn test_tool_choice_required() {
+        let json = r#""required""#;
+        let choice: ToolChoice = serde_json::from_str(json).unwrap();
+        assert!(choice.is_required());
+    }
+
+    #[test]
+    fn test_qwen_tool_call_format_detection() {
+        let text = "<|tool_call|>{\"name\": \"test\", \"arguments\": \"{}\"}<|end_tool_call|>";
+        let format = detect_tool_call_format(text);
+        assert_eq!(format, ToolCallFormat::QwenSpecialTokens);
+    }
+
+    #[test]
+    fn test_no_tool_call_format() {
+        let text = "This is just regular text without any tool calls.";
+        let format = detect_tool_call_format(text);
+        assert_eq!(format, ToolCallFormat::None);
+    }
+
+    #[test]
+    fn test_extract_qwen_tool_calls() {
+        let text = "<|tool_call|>{\"name\": \"get_weather\", \"arguments\": \"{\\\"location\\\": \\\"London\\\"}\"}<|end_tool_call|>";
+        let calls = extract_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].r#type, "function");
+        assert!(calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn test_extract_multiple_qwen_tool_calls() {
+        let text = "<|tool_call|>{\"name\": \"func1\", \"arguments\": \"{}\"}<|end_tool_call|>Some text<|tool_call|>{\"name\": \"func2\", \"arguments\": \"{\\\"x\\\": 1}\"}<|end_tool_call|>";
+        let calls = extract_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "func1");
+        assert_eq!(calls[1].function.name, "func2");
+    }
+
+    #[test]
+    fn test_chat_message_with_tool_calls() {
+        let msg = ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_123".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "test_func".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.role, "assistant");
+        assert!(parsed.content.is_none());
+        assert!(parsed.tool_calls.is_some());
+        assert_eq!(parsed.tool_calls.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_chat_message_with_tool_call_id() {
+        let msg = ChatMessage {
+            role: "tool".into(),
+            content: Some(ChatMessageContent::Text("Result from tool".into())),
+            tool_calls: None,
+            tool_call_id: Some("call_123".into()),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.role, "tool");
+        assert_eq!(parsed.tool_call_id, Some("call_123".into()));
+    }
+
     // ── ChatMessage round-trip ──
 
     #[test]
     fn chat_message_serde_roundtrip() {
         let msg = ChatMessage {
             role: "user".into(),
-            content: "Hello!".into(),
+            content: Some(ChatMessageContent::Text("Hello!".into())),
+            tool_calls: None,
+            tool_call_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.role, "user");
-        assert_eq!(parsed.content, "Hello!");
+        assert_eq!(parsed.content, Some(ChatMessageContent::Text("Hello!".into())));
     }
 
     // ── ChatCompletionRequest deserialization ──
@@ -577,7 +864,9 @@ mod tests {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: "Hello!".into(),
+                    content: Some(ChatMessageContent::Text("Hello!".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 finish_reason: Some("stop".into()),
             }],

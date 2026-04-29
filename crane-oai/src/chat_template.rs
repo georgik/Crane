@@ -7,7 +7,7 @@
 //!   `tokenizer_config.json` (works for Qwen, Llama, Mistral, …).
 //! * **[`HunyuanChatTemplate`]** — hardcoded template for Hunyuan models.
 
-use crate::openai_api::ChatMessage;
+use crate::openai_api::{ChatMessage, Tool};
 use crane_core::autotokenizer::AutoTokenizer;
 
 // ─────────────────────────────────────────────────────────────
@@ -16,7 +16,7 @@ use crane_core::autotokenizer::AutoTokenizer;
 
 /// Formats chat messages into a model-specific prompt string.
 pub trait ChatTemplateProcessor: Send + Sync {
-    fn apply(&self, messages: &[ChatMessage]) -> Result<String, String>;
+    fn apply(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> Result<String, String>;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -37,17 +37,42 @@ impl AutoChatTemplate {
 }
 
 impl ChatTemplateProcessor for AutoChatTemplate {
-    fn apply(&self, messages: &[ChatMessage]) -> Result<String, String> {
+    fn apply(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> Result<String, String> {
         // Build the list of {role, content} values expected by the Jinja template.
-        let template_messages: Vec<serde_json::Value> = messages
+        let mut template_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
-                serde_json::json!({
+                let mut msg = serde_json::json!({
                     "role": m.role,
                     "content": m.text_content(),
-                })
+                });
+                // Add tool_calls if present
+                if let Some(tool_calls) = &m.tool_calls {
+                    msg["tool_calls"] = serde_json::to_value(tool_calls)
+                        .map_err(|e| format!("Failed to serialize tool_calls: {e}"))?;
+                }
+                // Add tool_call_id if present
+                if let Some(tool_call_id) = &m.tool_call_id {
+                    msg["tool_call_id"] = serde_json::json!(tool_call_id);
+                }
+                Ok(msg)
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
+
+        // Inject tools if provided
+        if let Some(tools) = tools {
+            // Try to add tools to the first user message or system message
+            // This is a simple approach; more sophisticated templates may need tool-specific handling
+            if let Some(tools_value) = serde_json::to_value(tools).ok() {
+                // Add tools to the conversation context
+                // Many templates expect tools to be in a specific format
+                // For now, we'll try to pass them through the template
+                // If the template supports tools, it will use them
+                if let Some(first_msg) = template_messages.first_mut() {
+                    first_msg["tools"] = tools_value;
+                }
+            }
+        }
 
         self.tokenizer
             .apply_chat_template(&template_messages, true)
@@ -63,7 +88,7 @@ impl ChatTemplateProcessor for AutoChatTemplate {
 pub struct HunyuanChatTemplate;
 
 impl ChatTemplateProcessor for HunyuanChatTemplate {
-    fn apply(&self, messages: &[ChatMessage]) -> Result<String, String> {
+    fn apply(&self, messages: &[ChatMessage], _tools: Option<&[Tool]>) -> Result<String, String> {
         const BOS: &str = "<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>";
         const USER: &str = "<\u{ff5c}hy_User\u{ff5c}>";
         const ASSISTANT: &str = "<\u{ff5c}hy_Assistant\u{ff5c}>";
@@ -106,14 +131,18 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
 
 #[cfg(test)]
 mod tests {
-    use crate::openai_api::ChatMessageContent;
+    use crate::chat_template::HunyuanChatTemplate;
+    use crate::chat_template::ChatTemplateProcessor;
+    use crate::openai_api::{ChatMessage, ChatMessageContent};
 
     fn make_messages(pairs: &[(&str, &str)]) -> Vec<ChatMessage> {
         pairs
             .iter()
             .map(|(role, content)| ChatMessage {
                 role: role.to_string(),
-                content: ChatMessageContent::Text(content.to_string()),
+                content: Some(ChatMessageContent::Text(content.to_string())),
+                tool_calls: None,
+                tool_call_id: None,
             })
             .collect()
     }
@@ -124,7 +153,7 @@ mod tests {
     fn hunyuan_basic_user_message() {
         let tmpl = HunyuanChatTemplate;
         let msgs = make_messages(&[("user", "Hello")]);
-        let result = tmpl.apply(&msgs).unwrap();
+        let result = tmpl.apply(&msgs, None).unwrap();
 
         // Should start with BOS.
         assert!(result.starts_with("<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>"));
@@ -141,7 +170,7 @@ mod tests {
             ("system", "You are helpful"),
             ("user", "Hi"),
         ]);
-        let result = tmpl.apply(&msgs).unwrap();
+        let result = tmpl.apply(&msgs, None).unwrap();
 
         // System content should appear after BOS followed by SEP.
         let sep = "<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}3\u{ff5c}>";
@@ -156,7 +185,7 @@ mod tests {
             ("assistant", "Hi!"),
             ("user", "How are you?"),
         ]);
-        let result = tmpl.apply(&msgs).unwrap();
+        let result = tmpl.apply(&msgs, None).unwrap();
 
         let eos = "<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}2\u{ff5c}>";
         // Assistant response should end with EOS.
@@ -169,7 +198,7 @@ mod tests {
     fn hunyuan_empty_messages() {
         let tmpl = HunyuanChatTemplate;
         let msgs: Vec<ChatMessage> = vec![];
-        let result = tmpl.apply(&msgs).unwrap();
+        let result = tmpl.apply(&msgs, None).unwrap();
 
         // Should at least have BOS + ASSISTANT.
         assert!(result.starts_with("<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>"));
@@ -184,7 +213,7 @@ mod tests {
             ("tool", "some tool output"),
             ("user", "Next"),
         ]);
-        let result = tmpl.apply(&msgs).unwrap();
+        let result = tmpl.apply(&msgs, None).unwrap();
         // "tool" content should not appear with any tag.
         assert!(!result.contains("some tool output"));
     }
@@ -195,6 +224,6 @@ mod tests {
     fn hunyuan_implements_trait() {
         let proc: Box<dyn ChatTemplateProcessor> = Box::new(HunyuanChatTemplate);
         let msgs = make_messages(&[("user", "test")]);
-        assert!(proc.apply(&msgs).is_ok());
+        assert!(proc.apply(&msgs, None).is_ok());
     }
 }

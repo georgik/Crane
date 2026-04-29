@@ -83,6 +83,11 @@ struct Args {
     /// until existing ones complete and free memory.
     #[arg(long)]
     gpu_memory_limit: Option<String>,
+
+    /// Disable memory safety checks. DANGEROUS: may cause OOM and crashes.
+    /// Only use if you know what you're doing and have sufficient RAM.
+    #[arg(long)]
+    ignore_memory_limit: bool,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -157,6 +162,220 @@ pub fn make_error(
     )
 }
 
+// ─────────────────────────────────────────────────────────────
+//  Memory safety checks
+// ─────────────────────────────────────────────────────────────
+
+/// Get available system memory in bytes (for Metal/CPU).
+#[cfg(target_os = "macos")]
+fn get_available_memory() -> u64 {
+    use std::mem;
+
+    unsafe {
+        let mut stats: libc::vm_statistics64 = mem::zeroed();
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+
+        if libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            &mut stats as *mut _ as *mut libc::c_int,
+            &mut count,
+        ) == libc::KERN_SUCCESS
+        {
+            let page_size = 4096u64; // Standard page size
+            let free_pages = stats.free_count as u64;
+            let inactive_pages = stats.inactive_count as u64;
+            (free_pages + inactive_pages) * page_size
+        } else {
+            // Fallback: assume 50% of total memory is available
+            let mut total: u64 = 0;
+            let mut len = mem::size_of::<u64>();
+            let mut mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+            if libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                &mut total as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+            {
+                total / 2
+            } else {
+                8 * 1024 * 1024 * 1024 // 8GB fallback
+            }
+        }
+    }
+}
+
+/// Get available system memory in bytes (for Linux).
+#[cfg(target_os = "linux")]
+fn get_available_memory() -> u64 {
+    use std::fs;
+
+    // Read /proc/meminfo
+    if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+        let mut free = 0u64;
+        let mut buffers = 0u64;
+        let mut cached = 0u64;
+
+        for line in meminfo.lines() {
+            if line.starts_with("MemFree:") {
+                free = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    * 1024;
+            } else if line.starts_with("Buffers:") {
+                buffers = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    * 1024;
+            } else if line.starts_with("Cached:") {
+                cached = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    * 1024;
+            }
+        }
+
+        free + buffers + cached
+    } else {
+        8 * 1024 * 1024 * 1024 // 8GB fallback
+    }
+}
+
+/// Estimate model memory requirement based on parameter count and dtype.
+fn estimate_model_memory(model_path: &str, dtype: &crane_core::models::DType) -> Result<u64, String> {
+    // Try to estimate from config.json or safetensors
+    let config_path = std::path::Path::new(model_path).join("config.json");
+
+    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
+            // Get hidden size and num_layers from config
+            let hidden_size = config
+                .get("hidden_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let num_layers = config
+                .get("num_hidden_layers")
+                .or(config.get("num_layers"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let vocab_size = config
+                .get("vocab_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            // Estimate parameters: embedding + layers
+            let embedding_params = vocab_size * hidden_size;
+            let layer_params = num_layers * (
+                4 * hidden_size * hidden_size + // attention (q,k,v,o)
+                2 * hidden_size * hidden_size * 4 // mlp (gate, up, down * 4)
+            );
+            let total_params = embedding_params + layer_params;
+
+            // Memory = params * dtype_size
+            let bytes_per_param = match dtype {
+                crane_core::models::DType::F32 => 4,
+                crane_core::models::DType::F16 => 2,
+                crane_core::models::DType::BF16 => 2,
+                _ => 4,
+            };
+
+            // Add 2x for KV cache + activations
+            return Ok(total_params * bytes_per_param as u64 * 3);
+        }
+    }
+
+    // Fallback: check model directory size
+    if let Ok(model_dir) = std::fs::read_dir(model_path) {
+        let total_size: u64 = model_dir
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+
+        // Add 50% overhead for runtime memory
+        return Ok(total_size * 3 / 2);
+    }
+
+    // Ultimate fallback: assume 8GB requirement
+    Ok(8 * 1024 * 1024 * 1024)
+}
+
+/// Check if sufficient memory is available before loading model.
+fn check_memory_safety(
+    model_path: &str,
+    device: &crane_core::models::Device,
+    dtype: &crane_core::models::DType,
+    ignore_limit: bool,
+) -> Result<(), String> {
+    if ignore_limit {
+        tracing::warn!("⚠️  MEMORY SAFETY DISABLED via --ignore-memory-limit. You may experience OOM.");
+        return Ok(());
+    }
+
+    // Only check for Metal/CPU devices
+    match device {
+        crane_core::models::Device::Metal(_) | crane_core::models::Device::Cpu => {
+            let available = get_available_memory();
+            let estimated = estimate_model_memory(model_path, dtype)?;
+
+            tracing::info!("Memory check: available={}, estimated_need={}",
+                format_bytes(available), format_bytes(estimated));
+
+            if estimated > available {
+                let device_hint = if matches!(device, crane_core::models::Device::Metal(_)) {
+                    "Metal already uses F16. Try:\n\
+                     1. Use a smaller model (e.g., 0.5B instead of 3B)\n\
+                     2. Close other applications (Chrome, IDEs)\n\
+                     3. Add more RAM to your system\n\
+                     4. Override with --ignore-memory-limit (may cause OOM)"
+                } else {
+                    "Try:\n\
+                     1. Use a smaller model (e.g., 0.5B instead of 3B)\n\
+                     2. Close other applications\n\
+                     3. Override with --ignore-memory-limit (may cause OOM)"
+                };
+
+                return Err(format!(
+                    "Insufficient memory: need {} but only {} available.\n\
+                    {}\n\
+                    \n\
+                    System: {} available\n\
+                    Model: {} estimated",
+                    format_bytes(estimated),
+                    format_bytes(available),
+                    device_hint,
+                    format_bytes(available),
+                    format_bytes(estimated)
+                ));
+            }
+
+            // Warning if less than 2GB headroom
+            if available - estimated < 2 * 1024 * 1024 * 1024 {
+                tracing::warn!(
+                    "⚠️  Low memory headroom: only {} free after loading model. \
+                    Close other apps for stability.",
+                    format_bytes(available - estimated)
+                );
+            }
+
+            Ok(())
+        }
+        _ => Ok(()), // CUDA has its own memory management
+    }
+}
+
 // ═════════════════════════════════════════════════════════════
 //  Main
 // ═════════════════════════════════════════════════════════════
@@ -199,7 +418,11 @@ async fn main() -> Result<()> {
         crane_core::models::DType::BF16
     };
     #[cfg(not(feature = "cuda"))]
-    let dtype = crane_core::models::DType::F32;
+    let dtype = if matches!(device, crane_core::models::Device::Metal(_)) {
+        crane_core::models::DType::F16  // Use F16 on Metal to save memory
+    } else {
+        crane_core::models::DType::F32
+    };
 
     let device_name = format!("{:?}", device);
     let dtype_name = format!("{:?}", dtype);
@@ -592,6 +815,12 @@ async fn main() -> Result<()> {
         (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None)
     } else {
         // Standard LLM path.
+
+        // ── Pre-flight memory safety check ──
+        if let Err(e) = check_memory_safety(&args.model_path, &device, &dtype, args.ignore_memory_limit) {
+            return Err(anyhow::anyhow!("{}", e));
+        }
+
         let mut backend = engine::model_factory::create_backend(
             model_type, &args.model_path, &device, &dtype, format,
         )?;
