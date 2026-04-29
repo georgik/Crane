@@ -60,8 +60,9 @@ struct Args {
     cpu: bool,
 
     /// Max concurrent sequences in decode phase
-    #[arg(long, default_value_t = 16)]
-    max_concurrent: usize,
+    /// Defaults: 1 for Metal, 4 for CPU, 16 for CUDA
+    #[arg(long)]
+    max_concurrent: Option<usize>,
 
     /// Tokens to decode per sequence before switching (higher = fewer KV swaps)
     #[arg(long, default_value_t = 16)]
@@ -384,7 +385,37 @@ async fn main() -> Result<()> {
     // ── Branch: VLM model vs TTS model vs standard LLM ──
 
     let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, gemma4_vlm_tx_opt, tts_tx_opt):
-        (Option<EngineHandle>, tokenizers::Tokenizer, Vec<u32>, Box<dyn ChatTemplateProcessor>, Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>) = if is_tts {
+        (Option<EngineHandle>, tokenizers::Tokenizer, Vec<u32>, Box<dyn ChatTemplateProcessor>, Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>);
+
+    // Device-aware defaults for max_concurrent
+    let max_concurrent = args.max_concurrent.unwrap_or_else(|| {
+        // Get available memory in GB
+        let available_gb = get_available_memory() / (1024 * 1024 * 1024);
+
+        match device {
+            crane_core::models::Device::Metal(_) => {
+                // Metal on Apple Silicon: scale with memory and model size
+                // 3B model ~6GB, can handle 2-4 concurrent on 16GB system
+                // Formula: 1 concurrent per 4GB, capped at 4 for Metal
+                let base = (available_gb / 4).max(1) as usize;
+                base.min(4) // Cap at 4 for Metal (conservative)
+            }
+            crane_core::models::Device::Cpu => {
+                // CPU: scale with memory but more conservative
+                // 1 concurrent per 8GB
+                (available_gb / 8).max(1).min(4) as usize
+            }
+            _ => {
+                // CUDA/NVIDIA: higher baseline, scale with memory
+                // 1 concurrent per 2GB, capped at 16
+                (available_gb / 2).max(4).min(16) as usize
+            }
+        }
+    });
+    info!("Device-aware max_concurrent: {} (based on available memory)", max_concurrent);
+
+    // Split into branches based on model type
+    (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, gemma4_vlm_tx_opt, tts_tx_opt) = if is_tts {
         // TTS path: create Qwen3-TTS on a dedicated thread.
         info!("Loading TTS model (Qwen3-TTS) from: {}", args.model_path);
         let model_path_clone = args.model_path.clone();
@@ -789,7 +820,7 @@ async fn main() -> Result<()> {
 
         // ── Start engine on dedicated thread ──
         let (engine, handle) = InferenceEngine::new(
-            backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config,
+            backend, max_concurrent, args.decode_tokens_per_seq, memory_config,
         );
 
         std::thread::Builder::new()
@@ -798,7 +829,7 @@ async fn main() -> Result<()> {
             .expect("Failed to spawn engine thread");
         info!(
             "Inference engine started (max_concurrent={}, decode_tokens_per_seq={})",
-            args.max_concurrent, args.decode_tokens_per_seq,
+            max_concurrent, args.decode_tokens_per_seq,
         );
 
         (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None)
@@ -833,7 +864,7 @@ async fn main() -> Result<()> {
         device_name,
         host: args.host.clone(),
         port: args.port,
-        max_concurrent: args.max_concurrent,
+        max_concurrent,
         decode_tokens_per_seq: args.decode_tokens_per_seq,
         max_seq_len: args.max_seq_len,
         gpu_memory_limit: gpu_memory_limit_display,
@@ -866,7 +897,7 @@ async fn main() -> Result<()> {
             let mem_str = state.gpu_memory_limit.clone();
             println!("  Memory  : seq_len={seq_str}  gpu_limit={mem_str}");
         }
-        println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", args.max_concurrent, args.decode_tokens_per_seq);
+        println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", max_concurrent, args.decode_tokens_per_seq);
     }
     println!("  {sep2}");
     println!("  OpenAI-compatible API");
