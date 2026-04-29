@@ -17,8 +17,8 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 - [x] PaddleOCR VL 0.9B / 1.5
 - [x] Moonshine ASR
 - [x] Silero VAD
-- [x] 🎙️ Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder, voice cloning)
-- [ ] 🎙️ TTS: [Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
+- [x] Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder, voice cloning)
+- [ ] TTS: [Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
 
 
 submit your models make other users use it easier!
@@ -28,11 +28,12 @@ submit your models make other users use it easier!
 
 **Key Advantages**:
 
-- 🚀 **Blazing-Fast Inference**: Outperforms native PyTorch with Candle's optimized kernels
-- 🦀 **Rust-Powered**: Eliminate C++ complexity while maintaining native performance
-- 🍎 **Apple Silicon Optimized**: Achieve GPU acceleration via Metal on macOS devices
-- 🤖 **Hardware Agnostic**: Unified codebase for CPU/CUDA/Metal execution
-- 🌐 **OpenAI compatible API**: Supports OpenAI and SGLang interfaces
+- **Blazing-Fast Inference**: Outperforms native PyTorch with Candle's optimized kernels
+- **Rust-Powered**: Eliminate C++ complexity while maintaining native performance
+- **Apple Silicon Optimized**: Achieve GPU acceleration via Metal on macOS devices
+- **Hardware Agnostic**: Unified codebase for CPU/CUDA/Metal execution
+- **OpenAI Compatible API**: Supports OpenAI and SGLang interfaces including function calling
+- **Memory Safety**: Pre-flight memory checks prevent OOM crashes with device-aware resource management
 
 
 **Crane maybe the fastest (both speed and develop speed) framework you can use to build your AI applications!**
@@ -53,13 +54,15 @@ We include:
 - .... (Any AI ability you want power with AI.)
 
 
-## 🔥 Updates
+## Updates
 
-- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai;
-- **`2026.02.18`**: ⚡ Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies;
-- **`2026.01.30`**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/;
-- **`2025.03.21`**: 🔥 Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python;
-- **`2025.03.19`**: 🔥 project initialized;
+- **2026.04.29**: Memory safety system - pre-flight memory checks, device-aware concurrent scaling (Metal: 1-4, CPU: 1-4, CUDA: 4-16), F16 dtype on Metal by default (50% memory savings), sysinfo integration for accurate memory detection
+- **2026.04.29**: OpenAI function calling support - tool definitions, tool_call detection, multi-turn tool conversations
+- **2026.02.23**: Qwen3-TTS support added - full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai
+- **2026.02.18**: Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies
+- **2026.01.30**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/
+- **2025.03.21**: Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python
+- **2025.03.19**: project initialized
 
 
 
@@ -225,12 +228,48 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+**Function Calling**
+
+Crane supports OpenAI-compatible function calling with tool definitions:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+response = client.chat.completions.create(
+    model="Qwen2.5-7B-Instruct",
+    messages=[{"role": "user", "content": "What's the weather in London?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"}
+                },
+                "required": ["location"]
+            }
+        }
+    }]
+)
+
+# Model may return tool_calls instead of content
+if response.choices[0].message.tool_calls:
+    for tool_call in response.choices[0].message.tool_calls:
+        print(f"Function: {tool_call.function.name}")
+        print(f"Arguments: {tool_call.function.arguments}")
+```
+
+**Note**: Tool calling requires models trained for function use (e.g., Qwen2.5-7B-Instruct). Smaller models (0.5B-3B) may not reliably recognize tool definitions.
+
 Supported endpoints:
 
 | Family | Endpoint | Description |
 |--------|----------|-------------|
-| OpenAI | `POST /v1/chat/completions` | Chat completions (streaming & non-streaming) |
 | OpenAI | `POST /v1/completions` | Text completions |
+| OpenAI | `POST /v1/chat/completions` | Chat completions with function calling (streaming & non-streaming) |
 | OpenAI | `POST /v1/audio/speech` | Text-to-speech (Qwen3-TTS) |
 | OpenAI | `GET /v1/models` | List models |
 | OpenAI | `POST /v1/tokenize` | Tokenize text |
@@ -304,7 +343,45 @@ As all we know, a TTS model or any model based on LLM, it might consist of diffe
 One can reference to `crane-core/src/models/namo2.rs` for new arch add, which uses `Siglip2`, `mm_projector`, `Qwen2.5` to support a VL model.
 
 
-## ⚡ Inference Optimizations
+## Configuration
+
+### Memory Management
+
+Crane includes automatic memory safety checks to prevent out-of-memory crashes:
+
+**Device-Aware Defaults:**
+- **Metal** (Apple Silicon): F16 dtype by default (50% memory savings vs F32)
+- **max_concurrent**: Scales automatically based on available system memory
+  - Metal: 1 concurrent per 4GB available (capped at 4)
+  - CPU: 1 concurrent per 8GB available (capped at 4)
+  - CUDA: 1 concurrent per 2GB available (capped at 16)
+
+**Memory Estimation:**
+- Pre-flight check estimates model memory requirements from config.json
+- Falls back to directory size if config unavailable
+- Includes 25% overhead for runtime memory (activations + KV cache)
+
+**Override Protection:**
+```bash
+# Auto-detect safe values (recommended)
+./target/release/crane-oai --model-path /path/to/model
+
+# Manual override (use with caution)
+./target/release/crane-oai --model-path /path/to/model --max-concurrent 8
+
+# Bypass memory checks (dangerous: may cause OOM)
+./target/release/crane-oai --model-path /path/to/model --ignore-memory-limit
+```
+
+**Example Output:**
+```
+Device-aware max_concurrent: 2 (based on available memory)
+Memory check: available=8.2G, estimated_need=7.0G
+Model loaded successfully (type: Qwen25, format: Safetensors)
+Device: Metal(MetalDevice(DeviceId(1))) | dtype: F16
+```
+
+### Inference Optimizations
 
 Crane implements production-grade inference optimizations for both **Qwen3** and **Hunyuan Dense**.
 
