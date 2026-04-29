@@ -9,6 +9,7 @@
 //! - `POST /v1/detokenize`
 
 use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 use axum::{
     extract::{Path, State},
@@ -35,11 +36,23 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    info!("Chat completion request: model={}, messages={}, tools={}, stream={}",
+          req.model,
+          req.messages.len(),
+          req.tools.as_ref().map_or(0, |t| t.len()),
+          req.stream);
+
+    if let Some(tools) = &req.tools {
+        debug!("Tools in request: {}", serde_json::to_string_pretty(tools).unwrap_or_else(|_| "Invalid".to_string()));
+    }
+
     // If VLM model is loaded, delegate to VLM handler.
     if state.gemma4_vlm_tx.is_some() {
+        info!("Delegating to Gemma4 VLM handler");
         return vlm::gemma4_vlm_chat_completions(state, req).await;
     }
     if state.vlm_tx.is_some() {
+        info!("Delegating to VLM handler");
         return vlm::vlm_chat_completions(state, req).await;
     }
 
@@ -47,7 +60,10 @@ pub async fn chat_completions(
     let formatted = state
         .chat_template
         .apply(&req.messages, req.tools.as_deref())
-        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}")))?;
+        .map_err(|e| {
+            error!("Chat template failed: {}", e);
+            make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}"))
+        })?;
 
     // Tokenize.
     let input_ids = state

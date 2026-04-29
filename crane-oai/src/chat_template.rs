@@ -9,6 +9,7 @@
 
 use crate::openai_api::{ChatMessage, Tool};
 use crane_core::autotokenizer::AutoTokenizer;
+use tracing::{debug, error, info, warn};
 
 // ─────────────────────────────────────────────────────────────
 //  Trait
@@ -38,8 +39,12 @@ impl AutoChatTemplate {
 
 impl ChatTemplateProcessor for AutoChatTemplate {
     fn apply(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> Result<String, String> {
+        info!("Applying chat template: {} messages, tools: {}",
+              messages.len(),
+              tools.map_or(0, |t| t.len()));
+
         // Build the list of {role, content} values expected by the Jinja template.
-        let mut template_messages: Vec<serde_json::Value> = messages
+        let template_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
                 let mut msg = serde_json::json!({
@@ -50,6 +55,7 @@ impl ChatTemplateProcessor for AutoChatTemplate {
                 if let Some(tool_calls) = &m.tool_calls {
                     msg["tool_calls"] = serde_json::to_value(tool_calls)
                         .map_err(|e| format!("Failed to serialize tool_calls: {e}"))?;
+                    debug!("Message has tool_calls: {:?}", tool_calls);
                 }
                 // Add tool_call_id if present
                 if let Some(tool_call_id) = &m.tool_call_id {
@@ -59,21 +65,54 @@ impl ChatTemplateProcessor for AutoChatTemplate {
             })
             .collect::<Result<Vec<_>, String>>()?;
 
-        // Inject tools if provided
+        // Strategy: Try tool context first, fall back to messages-only if it fails
+        // This handles both tool-capable and non-tool templates gracefully
         if let Some(tools) = tools {
-            // Try to add tools to the first user message or system message
-            // This is a simple approach; more sophisticated templates may need tool-specific handling
-            if let Some(tools_value) = serde_json::to_value(tools).ok() {
-                // Add tools to the conversation context
-                // Many templates expect tools to be in a specific format
-                // For now, we'll try to pass them through the template
-                // If the template supports tools, it will use them
-                if let Some(first_msg) = template_messages.first_mut() {
+            info!("Processing {} tools for template", tools.len());
+
+            // Try tool-enabled context first
+            let context = serde_json::json!({
+                "messages": template_messages,
+                "tools": tools
+            });
+
+            debug!("Tool context attempt: {}", serde_json::to_string_pretty(&context).unwrap_or_else(|_| "Invalid".to_string()));
+
+            // Try tool context first
+            let tool_result = self.tokenizer.apply_chat_template(&context, true);
+            if let Ok(formatted) = tool_result {
+                info!("Tool context template succeeded");
+                return Ok(formatted);
+            }
+
+            warn!("Tool context template failed: {:?}", tool_result);
+            info!("Falling back to adding tools to first message");
+
+            // Fallback: Add tools to first message (some templates expect this)
+            let mut fallback_messages = template_messages.clone();
+            if let Some(first_msg) = fallback_messages.first_mut() {
+                if let Ok(tools_value) = serde_json::to_value(tools) {
                     first_msg["tools"] = tools_value;
+                    debug!("Fallback: tools added to first message");
+                }
+            }
+
+            match self.tokenizer.apply_chat_template(&fallback_messages, true) {
+                Ok(formatted) => {
+                    info!("Fallback template succeeded");
+                    return Ok(formatted);
+                }
+                Err(e) => {
+                    error!("Both tool and fallback templates failed");
+                    error!("Tool context error: {:?}", tool_result);
+                    error!("Fallback error: {:?}", e);
+                    return Err(format!("Chat template error: {e}"));
                 }
             }
         }
 
+        // No tools - pass messages directly
+        debug!("No tools, using messages-only template");
         self.tokenizer
             .apply_chat_template(&template_messages, true)
             .map_err(|e| format!("Chat template error: {e}"))
@@ -225,5 +264,69 @@ mod tests {
         let proc: Box<dyn ChatTemplateProcessor> = Box::new(HunyuanChatTemplate);
         let msgs = make_messages(&[("user", "test")]);
         assert!(proc.apply(&msgs, None).is_ok());
+    }
+
+    // ── Tool calling tests ──
+
+    use crate::openai_api::{Tool, FunctionDefinition};
+
+    fn make_tools() -> Vec<Tool> {
+        vec![Tool {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "get_time".to_string(),
+                description: Some("Get current time".to_string()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+                strict_mode: None,
+            },
+        }]
+    }
+
+    #[test]
+    fn test_tool_context_structure() {
+        let msgs = make_messages(&[("user", "What time is it?")]);
+        let tools = make_tools();
+
+        // Test that tools are properly structured in context
+        let template_messages: Vec<serde_json::Value> = msgs
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": m.text_content(),
+                })
+            })
+            .collect();
+
+        let mut context = serde_json::json!({
+            "messages": template_messages,
+        });
+
+        if let Ok(tools_value) = serde_json::to_value(&tools) {
+            context["tools"] = tools_value;
+        }
+
+        // Verify context structure
+        assert!(context.get("messages").is_some());
+        assert!(context.get("tools").is_some());
+        assert_eq!(context["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(context["tools"][0]["function"]["name"], "get_time");
+    }
+
+    #[test]
+    fn test_tool_serialization() {
+        let tools = make_tools();
+
+        // Test tool serialization
+        let tools_value = serde_json::to_value(&tools).unwrap();
+        assert_eq!(tools_value.as_array().unwrap().len(), 1);
+
+        let tool = &tools_value.as_array().unwrap()[0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "get_time");
+        assert_eq!(tool["function"]["description"], "Get current time");
     }
 }
