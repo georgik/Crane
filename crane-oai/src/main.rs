@@ -166,87 +166,20 @@ pub fn make_error(
 //  Memory safety checks
 // ─────────────────────────────────────────────────────────────
 
-/// Get available system memory in bytes (for Metal/CPU).
-#[cfg(target_os = "macos")]
+/// Get available system memory in bytes using sysinfo crate.
 fn get_available_memory() -> u64 {
-    use std::mem;
+    use sysinfo::System;
 
-    unsafe {
-        let mut stats: libc::vm_statistics64 = mem::zeroed();
-        let mut count = libc::HOST_VM_INFO64_COUNT;
+    let mut sys = System::new_all();
+    sys.refresh_all();
 
-        if libc::host_statistics64(
-            libc::mach_host_self(),
-            libc::HOST_VM_INFO64,
-            &mut stats as *mut _ as *mut libc::c_int,
-            &mut count,
-        ) == libc::KERN_SUCCESS
-        {
-            let page_size = 4096u64; // Standard page size
-            let free_pages = stats.free_count as u64;
-            let inactive_pages = stats.inactive_count as u64;
-            (free_pages + inactive_pages) * page_size
-        } else {
-            // Fallback: assume 50% of total memory is available
-            let mut total: u64 = 0;
-            let mut len = mem::size_of::<u64>();
-            let mut mib = [libc::CTL_HW, libc::HW_MEMSIZE];
-            if libc::sysctl(
-                mib.as_mut_ptr(),
-                2,
-                &mut total as *mut _ as *mut libc::c_void,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            ) == 0
-            {
-                total / 2
-            } else {
-                8 * 1024 * 1024 * 1024 // 8GB fallback
-            }
-        }
-    }
-}
-
-/// Get available system memory in bytes (for Linux).
-#[cfg(target_os = "linux")]
-fn get_available_memory() -> u64 {
-    use std::fs;
-
-    // Read /proc/meminfo
-    if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
-        let mut free = 0u64;
-        let mut buffers = 0u64;
-        let mut cached = 0u64;
-
-        for line in meminfo.lines() {
-            if line.starts_with("MemFree:") {
-                free = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    * 1024;
-            } else if line.starts_with("Buffers:") {
-                buffers = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    * 1024;
-            } else if line.starts_with("Cached:") {
-                cached = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    * 1024;
-            }
-        }
-
-        free + buffers + cached
+    // Available memory = free + usable (inactive/buffers)
+    let available = sys.available_memory();
+    if available > 0 {
+        available
     } else {
-        8 * 1024 * 1024 * 1024 // 8GB fallback
+        // Fallback to 50% of total memory
+        sys.total_memory() / 2
     }
 }
 
@@ -290,12 +223,12 @@ fn estimate_model_memory(model_path: &str, dtype: &crane_core::models::DType) ->
                 _ => 4,
             };
 
-            // Add 2x for KV cache + activations
-            return Ok(total_params * bytes_per_param as u64 * 3);
+            // Use 2x for KV cache + activations (more realistic than 3x)
+            return Ok(total_params * bytes_per_param as u64 * 2);
         }
     }
 
-    // Fallback: check model directory size
+    // Fallback: check model directory size (more accurate than estimation)
     if let Ok(model_dir) = std::fs::read_dir(model_path) {
         let total_size: u64 = model_dir
             .filter_map(|e| e.ok())
@@ -304,8 +237,8 @@ fn estimate_model_memory(model_path: &str, dtype: &crane_core::models::DType) ->
             .map(|m| m.len())
             .sum();
 
-        // Add 50% overhead for runtime memory
-        return Ok(total_size * 3 / 2);
+        // Add 25% overhead for runtime memory (activations + KV cache)
+        return Ok(total_size * 5 / 4);
     }
 
     // Ultimate fallback: assume 8GB requirement
