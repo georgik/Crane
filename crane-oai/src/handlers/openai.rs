@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+use std::fs;
+use std::path::PathBuf;
 
 use axum::{
     extract::{Path, State},
@@ -28,6 +30,34 @@ use super::sse;
 use super::vlm;
 
 // ─────────────────────────────────────────────────────────────
+//  Communication Logging
+// ─────────────────────────────────────────────────────────────
+
+fn get_comm_log_dir() -> PathBuf {
+    PathBuf::from("communication_logs")
+}
+
+fn log_communication(direction: &str, body: &serde_json::Value) {
+    let log_dir = get_comm_log_dir();
+    if let Err(e) = fs::create_dir_all(&log_dir) {
+        warn!("Failed to create communication log directory: {}", e);
+        return;
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+    let filename = format!("{}_{}.json", timestamp, direction);
+    let filepath = log_dir.join(&filename);
+
+    let formatted = serde_json::to_string_pretty(body).unwrap_or_else(|_| "Invalid JSON".to_string());
+
+    if let Err(e) = fs::write(&filepath, formatted) {
+        warn!("Failed to write communication log: {}", e);
+    } else {
+        debug!("Logged communication to: {}", filename);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Chat Completions
 // ─────────────────────────────────────────────────────────────
 
@@ -41,6 +71,9 @@ pub async fn chat_completions(
           req.messages.len(),
           req.tools.as_ref().map_or(0, |t| t.len()),
           req.stream);
+
+    // Log incoming request
+    log_communication("client_request", &serde_json::to_value(&req).unwrap_or_else(|_| serde_json::json!({"error": "Failed to serialize request"})));
 
     if let Some(tools) = &req.tools {
         debug!("Tools in request: {}", serde_json::to_string_pretty(tools).unwrap_or_else(|_| "Invalid".to_string()));
@@ -117,8 +150,20 @@ pub async fn chat_completions(
             info!("Tool calls detected: {} calls", tool_calls.len());
             debug!("Tool calls: {:?}", tool_calls);
 
+            // Extract any text content before tool calls for better UX
+            // Models often generate conversational text before <|tool_start|> tokens
+            let text_before_tools = full_text.split("<|tool_start|>").next()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
+            if let Some(ref text) = text_before_tools {
+                debug!("Text content before tool calls: {}", text);
+            }
+
             // Model generated tool call(s)
-            // Model generated tool call(s)
+            // Note: Don't include conversational text in content when tool_calls present
+            // This prevents clients from displaying text instead of executing tools
             ChatCompletionResponse {
                 id: request_id,
                 object: "chat.completion".into(),
@@ -128,11 +173,11 @@ pub async fn chat_completions(
                     index: 0,
                     message: ChatMessage {
                         role: "assistant".into(),
-                        content: None, // No text content when calling tools
+                        content: None, // Set to None when tool_calls present
                         tool_calls: Some(tool_calls),
                         tool_call_id: None,
                     },
-                    finish_reason: Some(finish_reason),
+                    finish_reason: Some("tool_calls".to_string()), // Must be "tool_calls" when tools present
                 }],
                 usage: Usage {
                     prompt_tokens,
@@ -164,6 +209,18 @@ pub async fn chat_completions(
                 },
             }
         };
+
+        // Log outgoing response
+        log_communication("server_response", &serde_json::to_value(&response).unwrap_or_else(|_| serde_json::json!({"error": "Failed to serialize response"})));
+
+        // If client requested streaming but we have tool calls, wrap in SSE format
+        if req.stream && req.tools.is_some() {
+            let model_name = state.model_name.clone();
+            let stream = sse::wrap_single_response_in_sse(response, model_name);
+            return Ok(Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response());
+        }
 
         Ok(Json(response).into_response())
     }

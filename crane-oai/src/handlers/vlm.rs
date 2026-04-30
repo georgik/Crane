@@ -206,6 +206,7 @@ pub async fn vlm_chat_completions(
                     delta: ChunkDelta {
                         role: Some("assistant".into()),
                         content: None,
+                        tool_calls: None,
                     },
                     finish_reason: None,
                 }],
@@ -228,6 +229,7 @@ pub async fn vlm_chat_completions(
                         delta: ChunkDelta {
                             role: None,
                             content: Some(text),
+                            tool_calls: None,
                         },
                         finish_reason: None,
                     }],
@@ -247,6 +249,7 @@ pub async fn vlm_chat_completions(
                     delta: ChunkDelta {
                         role: None,
                         content: None,
+                        tool_calls: None,
                     },
                     finish_reason: Some("stop".into()),
                 }],

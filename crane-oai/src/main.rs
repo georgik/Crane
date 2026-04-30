@@ -3,6 +3,7 @@ mod engine;
 mod handlers;
 mod openai_api;
 mod sglang_api;
+mod tool_call_wrapper;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

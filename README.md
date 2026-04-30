@@ -60,6 +60,7 @@ We include:
 
 ## Updates
 
+- **2026.04.30**: Streaming tool call parser - custom state machine for SSE streaming with special token filtering, incremental parsing, proper `index` field support, validated with Goose framework
 - **2026.04.29**: Tool calling implementation - complete OpenAI-compatible function calling with multi-format token detection, whitespace handling, flexible argument parsing (string/object), test coverage (69 tests), Qwen3-1.7B validated
 - **2026.04.29**: Memory safety system - pre-flight memory checks, device-aware concurrent scaling (Metal: 1-4, CPU: 1-4, CUDA: 4-16), F16 dtype on Metal by default (50% memory savings), sysinfo integration for accurate memory detection
 - **2026.02.23**: Qwen3-TTS support added - full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai
@@ -232,6 +233,22 @@ cargo test --workspace
 
 The testing framework ensures reliable tool calling behavior across different model families and formats.
 
+**Communication Logging**
+
+Crane logs all client requests and server responses to the `communication_logs/` directory for debugging:
+
+```bash
+# Logs are automatically saved with timestamps
+ls communication_logs/
+# 20260430_100111_437_client_request.json
+# 20260430_100111_429_client_request.json
+
+# Enable detailed logging
+RUST_LOG=debug ./target/release/crane-oai --model-path /path/to/model
+```
+
+This is particularly useful for debugging tool calling issues, verifying SSE streaming format, and validating client integration.
+
 ### OpenAI API Server
 
 Start a server compatible with OpenAI SDK and SGLang client:
@@ -298,16 +315,19 @@ if response.choices[0].message.tool_calls:
 
 **Tool Format Support**
 
-Crane detects and parses tool calling formats with whitespace handling:
+Crane detects and parses tool calling formats with streaming support:
 
 - **Qwen Special Tokens**: `<|tool_call|>...<|end_tool_call|>` (alternative format)
 - **Qwen Tool Start**: `<|tool_start|>...<|tool_end|>` (primary format)
   - Handles whitespace variations: `<| tool_start|>`, `<|tool_start |>`, `<|tool_start\n|>`
   - Regex detection for malformed tokens from model output
+  - Streaming-safe partial token detection to prevent special token leakage
 - **Flexible Arguments**: Accepts both `"arguments": "{}"` (string) and `"arguments": {}` (object)
 - **Conversational Context**: Extracts tool calls from model explanations and reasoning text
+- **SSE Streaming**: Real-time tool call delivery with proper `finish_reason` timing
+- **Index Field**: Includes required `index` field for multi-tool call tracking in streaming clients
 
-The parser handles whitespace in model-generated tokens that may include newlines or spaces within special token markers.
+The parser handles whitespace in model-generated tokens that may include newlines or spaces within special token markers, while ensuring clean streaming output without exposing special tokens to clients.
 
 **Model Compatibility**
 
@@ -411,9 +431,12 @@ Crane/
 │   └── src/
 │       ├── engine/      # Continuous batching inference engine
 │       ├── handlers/    # HTTP request handlers (OpenAI, SGLang, common)
-│       ├── openai_api.rs # OpenAI request/response types with tool calling support
-│       ├── sglang_api.rs # SGLang API types
-│       └── main.rs      # CLI entry point & router
+│       │   ├── sse.rs           # SSE streaming with tool call state machine
+│       │   └── vlm.rs           # VLM request handling
+│       ├── openai_api.rs        # OpenAI request/response types with tool calling support
+│       ├── tool_call_wrapper.rs # Streaming tool call parser with state management
+│       ├── sglang_api.rs        # SGLang API types
+│       └── main.rs              # CLI entry point & router
 ├── xtask/               # Testing infrastructure and development tools
 │   └── src/main.rs      # Test clients for tool calling, chat, performance
 ├── example/             # Example binaries (chat, ASR, vision, OCR, TTS)
@@ -423,7 +446,17 @@ Crane/
 
 ### Tool Calling Implementation
 
-Crane's tool calling system provides OpenAI-compatible function calling with error handling:
+Crane's tool calling system provides OpenAI-compatible function calling with streaming support:
+
+**Streaming Parser Architecture**
+
+Crane implements a custom state machine for Server-Sent Events (SSE) streaming with tool call detection:
+
+- **State Machine**: Normal mode -> Tool call buffering -> Tool call completion
+- **Special Token Filtering**: Removes `<|tool_start|>` and `<|tool_end|>` markers from client stream
+- **Incremental Parsing**: Detects partial token patterns (`<|tool`, `<|end`) to prevent leakage
+- **Deduplication Prevention**: Tracks sent tool calls to avoid duplicate SSE chunks
+- **OpenAI Compliance**: Includes required `index` field for multi-tool call tracking
 
 **Format Detection Pipeline**
 
@@ -441,10 +474,11 @@ The system automatically identifies the tool calling format from model-generated
 - **Conversational Extraction**: Finds tool calls within explanatory text
 - **Multi-call Support**: Extracts multiple sequential tool calls from single response
 - **Type Safety**: Strongly-typed Rust structures prevent API response errors
+- **Streaming Safety**: Premature `finish_reason` prevention ensures correct SSE flow
 
 **Testing**
 
-The 69 unit tests cover:
+The 69+ unit tests cover:
 
 - Regex detection patterns for various whitespace combinations
 - Format detection for all supported tool calling formats
@@ -453,8 +487,9 @@ The 69 unit tests cover:
 - Multiple sequential tool calls
 - Complex nested arguments with proper JSON stringification
 - Integration testing with complete request/response cycle
+- SSE streaming with tool call execution validation
 
-This validates tool calling behavior across different model families and generations.
+This validates tool calling behavior across different model families and frameworks (validated with Goose, OpenAI SDKs).
 
 ## Contribution
 
@@ -542,7 +577,32 @@ Environment variables for tuning:
 
 ### Tool Calling Implementation
 
-Crane provides OpenAI-compatible function calling with support for Qwen models. The implementation handles model output variations including whitespace, newlines, and different argument formats.
+Crane provides OpenAI-compatible function calling with streaming support for Qwen models. The implementation combines custom state machine parsing with multi-format detection.
+
+**Streaming Architecture**
+
+The streaming tool call parser (`crane-oai/src/tool_call_wrapper.rs`) implements:
+
+- **State Management**: Three-state machine (Normal -> InToolCall -> ToolCallComplete) for tracking parsing progress
+- **Token Buffering**: Accumulates model output until complete tool calls are detected
+- **Special Token Filtering**: Prevents `<|tool_start|>` and `<|tool_end|>` markers from reaching clients
+- **Incremental Delivery**: Streams normal text immediately, tool calls when complete
+- **SSE Protocol**: Correct `finish_reason` timing (only on `EngineResponse::Finished`, not during streaming)
+
+**Critical Field Requirements**
+
+Tool calls must include the `index` field for client compatibility:
+
+```rust
+pub struct ToolCall {
+    pub id: String,
+    pub index: Option<usize>,  // Required for multi-tool call tracking
+    pub r#type: String,
+    pub function: FunctionCall,
+}
+```
+
+Clients like Goose use `index` to track multiple tool calls in single response and append incremental argument chunks.
 
 **Supported Formats:**
 
@@ -560,7 +620,8 @@ Models can generate tool calls using Qwen special tokens:
 - Whitespace-aware parsing: Regex-based fallback for malformed tokens
 - Flexible argument handling: Accepts both `arguments: "{}"` (string) and `arguments: {}` (object) formats
 - OpenAI-compatible responses: Returns structured `tool_calls` array with unique call IDs
-- Test coverage: 69 unit tests covering detection, parsing, edge cases, and integration scenarios
+- Streaming-safe: No special token leakage, proper SSE chunk timing
+- Test coverage: 69+ unit tests covering detection, parsing, streaming, and integration scenarios
 
 **Request Format:**
 
@@ -614,11 +675,20 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 **Implementation Details:**
 
-The tool calling pipeline consists of three stages:
+The tool calling pipeline combines batch and streaming processing:
 
+**Non-Streaming (Complete Response):**
 1. **Detection**: Identifies tool call format using fast string matching with regex fallback
 2. **Normalization**: Handles whitespace variations in special tokens (`<|tool_start|>`, `<|tool_end|>`)
 3. **Extraction**: Parses JSON arguments with flexible type conversion
+4. **Validation**: Ensures `content: null` and `finish_reason: "tool_calls"` when tools present
+
+**Streaming (SSE Incremental):**
+1. **State Machine**: Tracks parsing state (Normal -> InToolCall -> ToolCallComplete)
+2. **Token Buffering**: Accumulates model output until complete tool calls detected
+3. **Special Token Filtering**: Removes `<|tool_start|>`, `<|tool_end|>` from client stream
+4. **Incremental Delivery**: Streams normal text immediately, tool calls when complete
+5. **SSE Protocol**: Prevents duplicate tool calls, times `finish_reason` correctly
 
 **Testing Infrastructure:**
 
@@ -627,12 +697,32 @@ Comprehensive test suite validating:
 - JSON parsing (string/object arguments, escaped characters)
 - Integration scenarios (conversational text, multiple calls, edge cases)
 - Real-world model output patterns
+- SSE streaming with tool execution (validated with Goose framework)
+
+**External Integration:**
+
+The streaming tool call parser design incorporates concepts from the SMG (Shepherd Model Gateway) project architecture:
+- State machine design for incremental parsing
+- Partial token handling to prevent special token leakage  
+- OpenAI protocol compliance for client compatibility
+
+Crane implements a custom parser (`crane-oai/src/tool_call_wrapper.rs`) adapted specifically for Qwen's pipe-style special token format (`<|tool_start|>`) while maintaining full compatibility with OpenAI SDKs and frameworks like Goose. The implementation was inspired by SMG's tool-parser architecture but built from scratch to handle Qwen's specific format requirements without external dependencies.
 
 **Model Compatibility:**
 
-- Qwen3-1.7B: Validated with reliable tool calling
+- Qwen3-1.7B: Validated with reliable tool calling and streaming
 - Models 7B+: Generally provide more consistent tool recognition
-- Smaller models (0.5B-3B): May have inconsistent tool format adherence
+- Smaller models (0.5B-3B): May have inconsistent tool format adherence despite flexible parsing
+
+**Troubleshooting Tool Calling:**
+
+Common issues and solutions:
+
+1. **Tool calls not executing**: Verify `index` field is present in ToolCall structure
+2. **Special tokens visible**: Check communication logs to confirm filtering is working
+3. **Streaming hangs**: Ensure `finish_reason` sent only on `EngineResponse::Finished`, not during token streaming
+4. **Parse errors**: Enable debug logging to see raw model output and parser state transitions
+5. **Client compatibility**: Test with communication logs to verify SSE chunk format matches OpenAI spec
 
 ## Speed
 

@@ -29,7 +29,7 @@ fn default_max_tokens() -> usize {
 
 // ── Request ──
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -60,7 +60,7 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Don't skip content when None - OpenAI requires explicit "content": null when tool_calls present
     pub content: Option<ChatMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -137,13 +137,13 @@ pub struct ImageUrl {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ResponseFormat {
     pub r#type: String,
@@ -200,6 +200,7 @@ pub struct FunctionName {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolCall {
     pub id: String,
+    pub index: Option<usize>,
     pub r#type: String,
     pub function: FunctionCall,
 }
@@ -322,6 +323,7 @@ fn parse_qwen_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
                 ) {
                     calls.push(ToolCall {
                         id: format!("call_{}", uuid::Uuid::new_v4()),
+                        index: Some(0),
                         r#type: "function".to_string(),
                         function: FunctionCall {
                             name: name.to_string(),
@@ -417,6 +419,7 @@ fn parse_qwen_tool_start_calls(text: &str) -> Option<Vec<ToolCall>> {
                     if let (Some(name), Some(args)) = (name, args) {
                         calls.push(ToolCall {
                             id: format!("call_{}", uuid::Uuid::new_v4()),
+                            index: Some(iteration - 1), // 0-indexed
                             r#type: "function".to_string(),
                             function: FunctionCall {
                                 name: name.to_string(),
@@ -509,6 +512,8 @@ pub struct ChunkDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -858,6 +863,7 @@ mod tests {
             content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_123".into(),
+                index: Some(0),
                 r#type: "function".into(),
                 function: FunctionCall {
                     name: "test_func".into(),
@@ -1597,5 +1603,160 @@ invalid json here
 
         let result = extract_tool_calls(&text);
         assert!(result.is_some(), "Should extract tool call from long text");
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  Goose Compatibility Tests
+    // ═════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_arguments_object_converted_to_string() {
+        // Test that arguments as object are converted to string (Goose compatibility)
+        let text = r#"<|tool_start|>
+{"name": "shell", "arguments": {"command": "ls"}}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with object arguments");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "shell");
+
+        // Arguments should be stringified JSON (starts with { as a string)
+        let args_str = &calls[0].function.arguments;
+        assert!(args_str.starts_with('{'), "Arguments should be stringified JSON object");
+        assert!(args_str.ends_with('}'), "Arguments should be properly closed");
+
+        // Verify it can be parsed back to JSON
+        let parsed: serde_json::Value = serde_json::from_str(args_str)
+            .expect("Stringified arguments should be valid JSON");
+        assert_eq!(parsed["command"], "ls");
+    }
+
+    #[test]
+    fn test_shell_command_tool_call() {
+        // Test the specific case: shell/ls command
+        let text = r#"<|tool_start|>
+{"name": "shell", "arguments": "{\"command\": \"ls\"}"}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse shell tool call");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "shell");
+        assert_eq!(calls[0].function.arguments, "{\"command\": \"ls\"}");
+        assert_eq!(calls[0].r#type, "function");
+        assert!(calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn test_tool_call_serialization_openai_format() {
+        // Test that ToolCall serializes to OpenAI-compatible format
+        let tool_call = ToolCall {
+            id: "call_test_123".to_string(),
+            index: Some(0),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: "shell".to_string(),
+                arguments: r#"{"command": "ls", "flags": "-la"}"#.to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&tool_call).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(parsed["id"], "call_test_123");
+        assert_eq!(parsed["type"], "function");
+        assert_eq!(parsed["function"]["name"], "shell");
+        assert_eq!(parsed["function"]["arguments"], r#"{"command": "ls", "flags": "-la"}"#);
+
+        // Arguments must be a string in JSON, not an object
+        assert!(parsed["function"]["arguments"].is_string(),
+                "OpenAI format requires arguments as string");
+    }
+
+    #[test]
+    fn test_multiple_tool_calls_openai_format() {
+        // Test multiple tool calls serialize correctly
+        let calls = vec![
+            ToolCall {
+                id: "call_1".to_string(),
+                index: Some(0),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "shell".to_string(),
+                    arguments: r#"{"command": "ls"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "call_2".to_string(),
+                index: Some(1),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "shell".to_string(),
+                    arguments: r#"{"command": "pwd"}"#.to_string(),
+                },
+            },
+        ];
+
+        let json = serde_json::to_string(&calls).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert!(parsed[0]["function"]["arguments"].is_string());
+        assert!(parsed[1]["function"]["arguments"].is_string());
+    }
+
+    #[test]
+    fn test_arguments_with_nested_json() {
+        // Test complex nested arguments (common in real tool calls)
+        let text = r#"<|tool_start|>
+{"name": "search_files", "arguments": "{\"path\": \"/home/user\", \"pattern\": \"*.rs\", \"options\": {\"recursive\": true, \"case_sensitive\": false}}"}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with nested arguments");
+
+        let calls = result.unwrap();
+        assert_eq!(calls[0].function.name, "search_files");
+
+        // Verify nested structure is preserved
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments)
+            .expect("Should parse nested arguments");
+        assert_eq!(args["path"], "/home/user");
+        assert_eq!(args["options"]["recursive"], true);
+    }
+
+    #[test]
+    fn test_empty_tool_call_arguments() {
+        // Test tool call with empty arguments object
+        let text = r#"<|tool_start|>
+{"name": "get_time", "arguments": {}}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with empty object arguments");
+
+        let calls = result.unwrap();
+        // Empty object should be stringified to "{}"
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn test_tool_call_with_unicode_args() {
+        // Test tool call with unicode characters in arguments
+        let text = r#"<|tool_start|>
+{"name": "echo", "arguments": "{\"text\": \"Hello 世界 🌍\"}"}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with unicode");
+
+        let calls = result.unwrap();
+        assert!(calls[0].function.arguments.contains("世界"));
+        assert!(calls[0].function.arguments.contains("🌍"));
     }
 }
