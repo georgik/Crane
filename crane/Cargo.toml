@@ -16,7 +16,7 @@ ribo = "0.1.3"
 tokenizers = "0.22.2"
 
 [features]
-onnx = ["crane-core/onnx"]
+# onnx = ["crane-core/onnx"]  # candle-onnx not currently used
 
 [lib]
 name = "crane"

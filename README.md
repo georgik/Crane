@@ -5,20 +5,22 @@
 ![](data/aa.gif)
 
 
-**Crane (🦩)** - **C**andle-based **R**ust **A**ccelerated **N**eural **E**ngine
+**Crane** - **C**andle-based **R**ust **A**ccelerated **N**eural **E**ngine
 A high-performance inference framework leveraging Rust's Candle for maximum speed on CPU/GPU.
 
 **Supported Models**:
 
-- [x] Qwen3 (0.6B ~ 30B+)
-- [x] Qwen 2.5 (0.5B ~ 72B)
+- [x] Qwen3 (0.6B ~ 30B+) with production tool calling (Qwen3-1.7B validated)
+- [x] Qwen 2.5 (0.5B ~ 72B) with function calling
 - [x] Hunyuan Dense
 - [x] Qwen3 VL (2B, 4B)
 - [x] PaddleOCR VL 0.9B / 1.5
 - [x] Moonshine ASR
 - [x] Silero VAD
-- [x] 🎙️ Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder, voice cloning)
-- [ ] 🎙️ TTS: [Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
+- [x] Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder, voice cloning)
+- [ ] TTS: [Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
+
+**Tool Calling Support**: Qwen3-1.7B validated for reliable tool calling. Models with 7B+ parameters generally provide more consistent tool recognition. Smaller models (0.5B-3B) may have inconsistent tool format adherence despite flexible parsing.
 
 
 submit your models make other users use it easier!
@@ -28,11 +30,13 @@ submit your models make other users use it easier!
 
 **Key Advantages**:
 
-- 🚀 **Blazing-Fast Inference**: Outperforms native PyTorch with Candle's optimized kernels
-- 🦀 **Rust-Powered**: Eliminate C++ complexity while maintaining native performance
-- 🍎 **Apple Silicon Optimized**: Achieve GPU acceleration via Metal on macOS devices
-- 🤖 **Hardware Agnostic**: Unified codebase for CPU/CUDA/Metal execution
-- 🌐 **OpenAI compatible API**: Supports OpenAI and SGLang interfaces
+- **Fast Inference**: Outperforms native PyTorch with Candle's optimized kernels
+- **Rust-Powered**: Eliminate C++ complexity while maintaining native performance
+- **Apple Silicon Optimized**: GPU acceleration via Metal on macOS devices
+- **Hardware Agnostic**: Unified codebase for CPU/CUDA/Metal execution
+- **OpenAI Compatible API**: Supports OpenAI and SGLang interfaces including function calling
+- **Tool Calling**: Multi-format detection, whitespace-aware parsing
+- **Memory Safety**: Pre-flight memory checks prevent OOM crashes with device-aware resource management
 
 
 **Crane maybe the fastest (both speed and develop speed) framework you can use to build your AI applications!**
@@ -43,23 +47,27 @@ Crane using candle as the only dependencies, inference with **fastest** speed cr
 *Crane is not a low-level SDK, you can call AI abilities out-of-box with ease*.
 
 We include:
-- Basic LLM chat;
-- VLM chat;
-- OCR with VLM;
-- VLA (on the way);
-- TTS;
-- ASR;
-- VAD;
-- .... (Any AI ability you want power with AI.)
+- Basic LLM chat
+- VLM chat
+- OCR with VLM
+- Tool calling and function execution
+- VLA (on the way)
+- TTS
+- ASR
+- VAD
+- .... (Any AI ability you want power with AI)
 
 
-## 🔥 Updates
+## Updates
 
-- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai;
-- **`2026.02.18`**: ⚡ Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies;
-- **`2026.01.30`**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/;
-- **`2025.03.21`**: 🔥 Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python;
-- **`2025.03.19`**: 🔥 project initialized;
+- **2026.04.30**: Streaming tool call parser - custom state machine for SSE streaming with special token filtering, incremental parsing, proper `index` field support, validated with Goose framework
+- **2026.04.29**: Tool calling implementation - complete OpenAI-compatible function calling with multi-format token detection, whitespace handling, flexible argument parsing (string/object), test coverage (69 tests), Qwen3-1.7B validated
+- **2026.04.29**: Memory safety system - pre-flight memory checks, device-aware concurrent scaling (Metal: 1-4, CPU: 1-4, CUDA: 4-16), F16 dtype on Metal by default (50% memory savings), sysinfo integration for accurate memory detection
+- **2026.02.23**: Qwen3-TTS support added - full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai
+- **2026.02.18**: Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies
+- **2026.01.30**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/
+- **2025.03.21**: Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python
+- **2025.03.19**: project initialized
 
 
 
@@ -75,7 +83,7 @@ We include:
 
 
 
-## 🧐 Why Choose Crane?
+## Why Choose Crane?
 
 While traditional approaches face limitations:
 
@@ -88,7 +96,7 @@ Crane bridges the gap through:
 2. **Cross-Platform Acceleration**: Metal GPU support achieves 3-5x speedup over CPU-only
 3. **Simplified Deployment**: Add new models with <100 LOC in most cases
 
-💡 **Pro Tip**: For macOS developers, Crane delivers comparable performance to llama.cpp with significantly lower maintenance overhead. You can use it out of box directly without any GGUF conversion or something like install llama.cpp etc.
+**Pro Tip**: For macOS developers, Crane delivers comparable performance to llama.cpp with significantly lower maintenance overhead. You can use it out of box directly without any GGUF conversion or something like install llama.cpp etc.
 
 Speed up your LLM inference speed on M series Apple Silicon devices to 6x with almost simillar code in your python (No quantization needed!):
 
@@ -173,7 +181,7 @@ cargo run --bin qwenchat --release
 
 
 
-## 📖 Usage
+## Usage
 
 To use `crane`, here are some notes:
 
@@ -193,6 +201,53 @@ To use `crane`, here are some notes:
    ```
 
 That's it!
+
+### Testing and Development Tools
+
+Crane includes a testing infrastructure (`xtask`) for validation and development:
+
+```bash
+# Build testing tools
+cargo build -p xtask --release
+
+# Test tool calling pipeline
+cargo xtask test-tools [--model MODEL_NAME] [--timeout SECONDS]
+
+# Test basic chat functionality
+cargo xtask test-chat [--model MODEL_NAME] [--timeout SECONDS]
+
+# Run unit tests for tool extraction
+cargo test -p crane-oai --bin crane-oai 'test_parse_qwen'
+
+# Run full test suite
+cargo test --workspace
+```
+
+**Testing Features:**
+
+- **Auto-detection**: Automatically discovers available models from `/v1/models` endpoint
+- **Configurable timeouts**: CLI arguments and environment variable (`XTASK_TIMEOUT`) support
+- **Structured logging**: Detailed request/response logging with timestamps
+- **Tool validation**: Comprehensive tool calling format detection and parsing validation
+- **Performance monitoring**: Request timing and throughput measurements
+
+The testing framework ensures reliable tool calling behavior across different model families and formats.
+
+**Communication Logging**
+
+Crane logs all client requests and server responses to the `communication_logs/` directory for debugging:
+
+```bash
+# Logs are automatically saved with timestamps
+ls communication_logs/
+# 20260430_100111_437_client_request.json
+# 20260430_100111_429_client_request.json
+
+# Enable detailed logging
+RUST_LOG=debug ./target/release/crane-oai --model-path /path/to/model
+```
+
+This is particularly useful for debugging tool calling issues, verifying SSE streaming format, and validating client integration.
 
 ### OpenAI API Server
 
@@ -225,12 +280,109 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+**Function Calling**
+
+Crane supports OpenAI-compatible function calling with tool definition handling, format detection, and parsing:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+response = client.chat.completions.create(
+    model="Qwen3-1.7B",
+    messages=[{"role": "user", "content": "What's the current time?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Get current time",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    }]
+)
+
+# Model returns tool_calls instead of content
+if response.choices[0].message.tool_calls:
+    for tool_call in response.choices[0].message.tool_calls:
+        print(f"Function: {tool_call.function.name}")
+        print(f"Arguments: {tool_call.function.arguments}")
+        # Execute function and send result back to model
+```
+
+**Tool Format Support**
+
+Crane detects and parses tool calling formats with streaming support:
+
+- **Qwen Special Tokens**: `<|tool_call|>...<|end_tool_call|>` (alternative format)
+- **Qwen Tool Start**: `<|tool_start|>...<|tool_end|>` (primary format)
+  - Handles whitespace variations: `<| tool_start|>`, `<|tool_start |>`, `<|tool_start\n|>`
+  - Regex detection for malformed tokens from model output
+  - Streaming-safe partial token detection to prevent special token leakage
+- **Flexible Arguments**: Accepts both `"arguments": "{}"` (string) and `"arguments": {}` (object)
+- **Conversational Context**: Extracts tool calls from model explanations and reasoning text
+- **SSE Streaming**: Real-time tool call delivery with proper `finish_reason` timing
+- **Index Field**: Includes required `index` field for multi-tool call tracking in streaming clients
+
+The parser handles whitespace in model-generated tokens that may include newlines or spaces within special token markers, while ensuring clean streaming output without exposing special tokens to clients.
+
+**Model Compatibility**
+
+Tool calling requires models specifically trained for function use. Validated models:
+
+- **Qwen3-1.7B**: Production validated with reliable tool calling
+- **Qwen2.5-7B+**: Enhanced tool recognition and argument generation
+- **Qwen3-4B+**: Modern tool calling format support
+
+Models with 7B+ parameters generally provide more consistent tool recognition. Smaller models (0.5B-3B) may have inconsistent tool format adherence despite flexible parsing capabilities.
+
+**Testing Infrastructure**
+
+Crane includes testing infrastructure for tool calling validation:
+
+```bash
+# Test tool calling with auto-detected model
+cargo xtask test-tools
+
+# Test with specific model and timeout
+cargo xtask test-tools Qwen2.5-7B-Instruct --timeout=180
+
+# Test basic chat functionality
+cargo xtask test-chat
+```
+
+The test suite includes 52+ unit tests covering tool format detection, JSON parsing, edge cases, and integration scenarios.
+
+**Multi-turn Tool Conversations**
+
+Crane supports multi-turn conversations with tool execution:
+
+1. User provides tool definitions and query
+2. Model generates structured tool_calls response
+3. Client executes tools and returns results as tool messages
+4. Model processes tool results and provides final answer
+5. Continues normal conversation flow
+
+**Logging and Debugging**
+
+Comprehensive logging tracks the entire tool calling pipeline:
+
+```bash
+# Enable detailed logging
+RUST_LOG=debug ./target/release/crane-oai --model-path /path/to/model
+
+# Logs show: tool detection, format parsing, JSON extraction, API response structure
+```
+
 Supported endpoints:
 
 | Family | Endpoint | Description |
 |--------|----------|-------------|
-| OpenAI | `POST /v1/chat/completions` | Chat completions (streaming & non-streaming) |
 | OpenAI | `POST /v1/completions` | Text completions |
+| OpenAI | `POST /v1/chat/completions` | Chat completions with function calling (streaming & non-streaming) |
 | OpenAI | `POST /v1/audio/speech` | Text-to-speech (Qwen3-TTS) |
 | OpenAI | `GET /v1/models` | List models |
 | OpenAI | `POST /v1/tokenize` | Tokenize text |
@@ -242,7 +394,7 @@ Supported endpoints:
 | Mgmt   | `GET /health` | Health check |
 | Mgmt   | `GET /v1/stats` | Engine statistics |
 
-✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. `response_format` currently supports `wav` and `pcm` (other formats return `400`). See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
+**Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. `response_format` currently supports `wav` and `pcm` (other formats return `400`). See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
 
 ### TTS Examples
 
@@ -264,11 +416,11 @@ All TTS examples save generated audio files to `data/audio/output`.
 - Base (voice clone): [vc1_base.wav](data/audio/output/vc1_base.wav), [vc2_base.wav](data/audio/output/vc2_base.wav)
 - CustomVoice: [custom_voice_zh.wav](data/audio/output/custom_voice_zh.wav), [custom_voice_en.wav](data/audio/output/custom_voice_en.wav), [custom_voice_ja.wav](data/audio/output/custom_voice_ja.wav)
 
-✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
+**Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
 
 Now you can run LLM extremly fast (about 6x faster than vanilla transformers on M1)!
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 Crane/
@@ -279,15 +431,67 @@ Crane/
 │   └── src/
 │       ├── engine/      # Continuous batching inference engine
 │       ├── handlers/    # HTTP request handlers (OpenAI, SGLang, common)
-│       ├── openai_api.rs # OpenAI request/response types
-│       ├── sglang_api.rs # SGLang API types
-│       └── main.rs      # CLI entry point & router
+│       │   ├── sse.rs           # SSE streaming with tool call state machine
+│       │   └── vlm.rs           # VLM request handling
+│       ├── openai_api.rs        # OpenAI request/response types with tool calling support
+│       ├── tool_call_wrapper.rs # Streaming tool call parser with state management
+│       ├── sglang_api.rs        # SGLang API types
+│       └── main.rs              # CLI entry point & router
+├── xtask/               # Testing infrastructure and development tools
+│   └── src/main.rs      # Test clients for tool calling, chat, performance
 ├── example/             # Example binaries (chat, ASR, vision, OCR, TTS)
 ├── vendor/              # Vendored references (llama.cpp, sglang, vllm)
 └── scripts/             # Utility scripts
 ```
 
-## 🍺 Contribution
+### Tool Calling Implementation
+
+Crane's tool calling system provides OpenAI-compatible function calling with streaming support:
+
+**Streaming Parser Architecture**
+
+Crane implements a custom state machine for Server-Sent Events (SSE) streaming with tool call detection:
+
+- **State Machine**: Normal mode -> Tool call buffering -> Tool call completion
+- **Special Token Filtering**: Removes `<|tool_start|>` and `<|tool_end|>` markers from client stream
+- **Incremental Parsing**: Detects partial token patterns (`<|tool`, `<|end`) to prevent leakage
+- **Deduplication Prevention**: Tracks sent tool calls to avoid duplicate SSE chunks
+- **OpenAI Compliance**: Includes required `index` field for multi-tool call tracking
+
+**Format Detection Pipeline**
+
+The system automatically identifies the tool calling format from model-generated text:
+
+1. **Fast Path Matching**: Direct string comparison for common formats
+2. **Regex Fallback**: Handles whitespace variations in special tokens
+3. **Format Validation**: Confirms both start and end tokens present
+4. **Argument Parsing**: Flexible JSON extraction with type conversion
+
+**Parsing Features**
+
+- **Token Normalization**: Converts malformed tokens (`<|tool_start\n|>` to canonical form)
+- **Flexible Arguments**: Handles both `arguments: "{}"` (string) and `arguments: {}` (object)
+- **Conversational Extraction**: Finds tool calls within explanatory text
+- **Multi-call Support**: Extracts multiple sequential tool calls from single response
+- **Type Safety**: Strongly-typed Rust structures prevent API response errors
+- **Streaming Safety**: Premature `finish_reason` prevention ensures correct SSE flow
+
+**Testing**
+
+The 69+ unit tests cover:
+
+- Regex detection patterns for various whitespace combinations
+- Format detection for all supported tool calling formats
+- Real-world model output patterns (conversational text + tool calls)
+- Edge cases (empty arguments, escaped characters, incomplete tokens)
+- Multiple sequential tool calls
+- Complex nested arguments with proper JSON stringification
+- Integration testing with complete request/response cycle
+- SSE streaming with tool call execution validation
+
+This validates tool calling behavior across different model families and frameworks (validated with Goose, OpenAI SDKs).
+
+## Contribution
 
 PR are welcomed right now! Since we need support a brand range of new models, but both Crane and HuggingFace's Candle is very limited model scope, so please join and help!
 
@@ -303,8 +507,62 @@ As all we know, a TTS model or any model based on LLM, it might consist of diffe
 
 One can reference to `crane-core/src/models/namo2.rs` for new arch add, which uses `Siglip2`, `mm_projector`, `Qwen2.5` to support a VL model.
 
+3. How to add tool calling support for new models?
 
-## ⚡ Inference Optimizations
+When adding tool calling support for new model families:
+
+- **Identify Format**: Determine the special token format the model uses for tool calls
+- **Add Detection**: Update `detect_tool_call_format()` in `crane-oai/src/openai_api.rs`
+- **Implement Parser**: Add parsing function following existing patterns in `parse_qwen_tool_calls()` or `parse_qwen_tool_start_calls()`
+- **Add Tests**: Include unit tests in the `openai_api::tests` module
+- **Validate**: Use `cargo xtask test-tools` to validate with actual model inference
+
+Key considerations:
+- Models may insert whitespace/newlines in special tokens - handle variations
+- Test with edge cases: malformed JSON, incomplete tokens, multiple sequential calls
+- Ensure API response structure matches OpenAI specification
+- Add logging for debugging tool detection and parsing failures
+
+
+## Configuration
+
+### Memory Management
+
+Crane includes automatic memory safety checks to prevent out-of-memory crashes:
+
+**Device-Aware Defaults:**
+- **Metal** (Apple Silicon): F16 dtype by default (50% memory savings vs F32)
+- **max_concurrent**: Scales automatically based on available system memory
+  - Metal: 1 concurrent per 4GB available (capped at 4)
+  - CPU: 1 concurrent per 8GB available (capped at 4)
+  - CUDA: 1 concurrent per 2GB available (capped at 16)
+
+**Memory Estimation:**
+- Pre-flight check estimates model memory requirements from config.json
+- Falls back to directory size if config unavailable
+- Includes 25% overhead for runtime memory (activations + KV cache)
+
+**Override Protection:**
+```bash
+# Auto-detect safe values (recommended)
+./target/release/crane-oai --model-path /path/to/model
+
+# Manual override (use with caution)
+./target/release/crane-oai --model-path /path/to/model --max-concurrent 8
+
+# Bypass memory checks (dangerous: may cause OOM)
+./target/release/crane-oai --model-path /path/to/model --ignore-memory-limit
+```
+
+**Example Output:**
+```
+Device-aware max_concurrent: 2 (based on available memory)
+Memory check: available=8.2G, estimated_need=7.0G
+Model loaded successfully (type: Qwen25, format: Safetensors)
+Device: Metal(MetalDevice(DeviceId(1))) | dtype: F16
+```
+
+### Inference Optimizations
 
 Crane implements production-grade inference optimizations for both **Qwen3** and **Hunyuan Dense**.
 
@@ -317,7 +575,156 @@ Environment variables for tuning:
 | `CRANE_TOPK_SAMPLE_ON_CPU` | `0` | Force CPU sampling after GPU topk |
 | `CRANE_SAMPLE_TRACE` | `0` | Enable detailed sampling timing logs |
 
-## ⚡️ Speed
+### Tool Calling Implementation
+
+Crane provides OpenAI-compatible function calling with streaming support for Qwen models. The implementation combines custom state machine parsing with multi-format detection.
+
+**Streaming Architecture**
+
+The streaming tool call parser (`crane-oai/src/tool_call_wrapper.rs`) implements:
+
+- **State Management**: Three-state machine (Normal -> InToolCall -> ToolCallComplete) for tracking parsing progress
+- **Token Buffering**: Accumulates model output until complete tool calls are detected
+- **Special Token Filtering**: Prevents `<|tool_start|>` and `<|tool_end|>` markers from reaching clients
+- **Incremental Delivery**: Streams normal text immediately, tool calls when complete
+- **SSE Protocol**: Correct `finish_reason` timing (only on `EngineResponse::Finished`, not during streaming)
+
+**Critical Field Requirements**
+
+Tool calls must include the `index` field for client compatibility:
+
+```rust
+pub struct ToolCall {
+    pub id: String,
+    pub index: Option<usize>,  // Required for multi-tool call tracking
+    pub r#type: String,
+    pub function: FunctionCall,
+}
+```
+
+Clients like Goose use `index` to track multiple tool calls in single response and append incremental argument chunks.
+
+**Supported Formats:**
+
+Models can generate tool calls using Qwen special tokens:
+
+```
+<|tool_start|>
+{"name": "function_name", "arguments": "{}"}
+<|tool_end|>
+```
+
+**Key Features:**
+
+- Multi-format token detection: Handles model-generated variations in special token formatting
+- Whitespace-aware parsing: Regex-based fallback for malformed tokens
+- Flexible argument handling: Accepts both `arguments: "{}"` (string) and `arguments: {}` (object) formats
+- OpenAI-compatible responses: Returns structured `tool_calls` array with unique call IDs
+- Streaming-safe: No special token leakage, proper SSE chunk timing
+- Test coverage: 69+ unit tests covering detection, parsing, streaming, and integration scenarios
+
+**Request Format:**
+
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-1.7B",
+    "messages": [
+      {"role": "user", "content": "What time is it?"}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_time",
+          "description": "Get current time",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
+    ]
+  }'
+```
+
+**Response Format:**
+
+```json
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "call_95eabd13-0431-45e7-95f4-4e8ed4a8e798",
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "arguments": "{}"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Implementation Details:**
+
+The tool calling pipeline combines batch and streaming processing:
+
+**Non-Streaming (Complete Response):**
+1. **Detection**: Identifies tool call format using fast string matching with regex fallback
+2. **Normalization**: Handles whitespace variations in special tokens (`<|tool_start|>`, `<|tool_end|>`)
+3. **Extraction**: Parses JSON arguments with flexible type conversion
+4. **Validation**: Ensures `content: null` and `finish_reason: "tool_calls"` when tools present
+
+**Streaming (SSE Incremental):**
+1. **State Machine**: Tracks parsing state (Normal -> InToolCall -> ToolCallComplete)
+2. **Token Buffering**: Accumulates model output until complete tool calls detected
+3. **Special Token Filtering**: Removes `<|tool_start|>`, `<|tool_end|>` from client stream
+4. **Incremental Delivery**: Streams normal text immediately, tool calls when complete
+5. **SSE Protocol**: Prevents duplicate tool calls, times `finish_reason` correctly
+
+**Testing Infrastructure:**
+
+Comprehensive test suite validating:
+- Token format detection (regex patterns, whitespace handling)
+- JSON parsing (string/object arguments, escaped characters)
+- Integration scenarios (conversational text, multiple calls, edge cases)
+- Real-world model output patterns
+- SSE streaming with tool execution (validated with Goose framework)
+
+**External Integration:**
+
+The streaming tool call parser design incorporates concepts from the SMG (Shepherd Model Gateway) project architecture:
+- State machine design for incremental parsing
+- Partial token handling to prevent special token leakage  
+- OpenAI protocol compliance for client compatibility
+
+Crane implements a custom parser (`crane-oai/src/tool_call_wrapper.rs`) adapted specifically for Qwen's pipe-style special token format (`<|tool_start|>`) while maintaining full compatibility with OpenAI SDKs and frameworks like Goose. The implementation was inspired by SMG's tool-parser architecture but built from scratch to handle Qwen's specific format requirements without external dependencies.
+
+**Model Compatibility:**
+
+- Qwen3-1.7B: Validated with reliable tool calling and streaming
+- Models 7B+: Generally provide more consistent tool recognition
+- Smaller models (0.5B-3B): May have inconsistent tool format adherence despite flexible parsing
+
+**Troubleshooting Tool Calling:**
+
+Common issues and solutions:
+
+1. **Tool calls not executing**: Verify `index` field is present in ToolCall structure
+2. **Special tokens visible**: Check communication logs to confirm filtering is working
+3. **Streaming hangs**: Ensure `finish_reason` sent only on `EngineResponse::Finished`, not during token streaming
+4. **Parse errors**: Enable debug logging to see raw model output and parser state transitions
+5. **Client compatibility**: Test with communication logs to verify SSE chunk format matches OpenAI spec
+
+## Speed
 
 Here are some speedup compare between **Crane** can other framework.
 
@@ -339,7 +746,7 @@ f16:
 - int8 quantization still on the way, it's even faster!
 
 
-## 📑 Citation
+## Citation
 
 If you use Crane in your research or projects, please cite using BibTeX:
 

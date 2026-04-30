@@ -3,6 +3,7 @@ mod engine;
 mod handlers;
 mod openai_api;
 mod sglang_api;
+mod tool_call_wrapper;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,8 +61,9 @@ struct Args {
     cpu: bool,
 
     /// Max concurrent sequences in decode phase
-    #[arg(long, default_value_t = 16)]
-    max_concurrent: usize,
+    /// Defaults: 1 for Metal, 4 for CPU, 16 for CUDA
+    #[arg(long)]
+    max_concurrent: Option<usize>,
 
     /// Tokens to decode per sequence before switching (higher = fewer KV swaps)
     #[arg(long, default_value_t = 16)]
@@ -83,6 +85,11 @@ struct Args {
     /// until existing ones complete and free memory.
     #[arg(long)]
     gpu_memory_limit: Option<String>,
+
+    /// Disable memory safety checks. DANGEROUS: may cause OOM and crashes.
+    /// Only use if you know what you're doing and have sufficient RAM.
+    #[arg(long)]
+    ignore_memory_limit: bool,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -157,6 +164,153 @@ pub fn make_error(
     )
 }
 
+// ─────────────────────────────────────────────────────────────
+//  Memory safety checks
+// ─────────────────────────────────────────────────────────────
+
+/// Get available system memory in bytes using sysinfo crate.
+fn get_available_memory() -> u64 {
+    use sysinfo::System;
+
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    // Available memory = free + usable (inactive/buffers)
+    let available = sys.available_memory();
+    if available > 0 {
+        available
+    } else {
+        // Fallback to 50% of total memory
+        sys.total_memory() / 2
+    }
+}
+
+/// Estimate model memory requirement based on parameter count and dtype.
+fn estimate_model_memory(model_path: &str, dtype: &crane_core::models::DType) -> Result<u64, String> {
+    // Try to estimate from config.json or safetensors
+    let config_path = std::path::Path::new(model_path).join("config.json");
+
+    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
+            // Get hidden size and num_layers from config
+            let hidden_size = config
+                .get("hidden_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let num_layers = config
+                .get("num_hidden_layers")
+                .or(config.get("num_layers"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let vocab_size = config
+                .get("vocab_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            // Estimate parameters: embedding + layers
+            let embedding_params = vocab_size * hidden_size;
+            let layer_params = num_layers * (
+                4 * hidden_size * hidden_size + // attention (q,k,v,o)
+                2 * hidden_size * hidden_size * 4 // mlp (gate, up, down * 4)
+            );
+            let total_params = embedding_params + layer_params;
+
+            // Memory = params * dtype_size
+            let bytes_per_param = match dtype {
+                crane_core::models::DType::F32 => 4,
+                crane_core::models::DType::F16 => 2,
+                crane_core::models::DType::BF16 => 2,
+                _ => 4,
+            };
+
+            // Use 2x for KV cache + activations (more realistic than 3x)
+            return Ok(total_params * bytes_per_param as u64 * 2);
+        }
+    }
+
+    // Fallback: check model directory size (more accurate than estimation)
+    if let Ok(model_dir) = std::fs::read_dir(model_path) {
+        let total_size: u64 = model_dir
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+
+        // Add 25% overhead for runtime memory (activations + KV cache)
+        return Ok(total_size * 5 / 4);
+    }
+
+    // Ultimate fallback: assume 8GB requirement
+    Ok(8 * 1024 * 1024 * 1024)
+}
+
+/// Check if sufficient memory is available before loading model.
+fn check_memory_safety(
+    model_path: &str,
+    device: &crane_core::models::Device,
+    dtype: &crane_core::models::DType,
+    ignore_limit: bool,
+) -> Result<(), String> {
+    if ignore_limit {
+        tracing::warn!("⚠️  MEMORY SAFETY DISABLED via --ignore-memory-limit. You may experience OOM.");
+        return Ok(());
+    }
+
+    // Only check for Metal/CPU devices
+    match device {
+        crane_core::models::Device::Metal(_) | crane_core::models::Device::Cpu => {
+            let available = get_available_memory();
+            let estimated = estimate_model_memory(model_path, dtype)?;
+
+            tracing::info!("Memory check: available={}, estimated_need={}",
+                format_bytes(available), format_bytes(estimated));
+
+            if estimated > available {
+                let device_hint = if matches!(device, crane_core::models::Device::Metal(_)) {
+                    "Metal already uses F16. Try:\n\
+                     1. Use a smaller model (e.g., 0.5B instead of 3B)\n\
+                     2. Close other applications (Chrome, IDEs)\n\
+                     3. Add more RAM to your system\n\
+                     4. Override with --ignore-memory-limit (may cause OOM)"
+                } else {
+                    "Try:\n\
+                     1. Use a smaller model (e.g., 0.5B instead of 3B)\n\
+                     2. Close other applications\n\
+                     3. Override with --ignore-memory-limit (may cause OOM)"
+                };
+
+                return Err(format!(
+                    "Insufficient memory: need {} but only {} available.\n\
+                    {}\n\
+                    \n\
+                    System: {} available\n\
+                    Model: {} estimated",
+                    format_bytes(estimated),
+                    format_bytes(available),
+                    device_hint,
+                    format_bytes(available),
+                    format_bytes(estimated)
+                ));
+            }
+
+            // Warning if less than 2GB headroom
+            if available - estimated < 2 * 1024 * 1024 * 1024 {
+                tracing::warn!(
+                    "⚠️  Low memory headroom: only {} free after loading model. \
+                    Close other apps for stability.",
+                    format_bytes(available - estimated)
+                );
+            }
+
+            Ok(())
+        }
+        _ => Ok(()), // CUDA has its own memory management
+    }
+}
+
 // ═════════════════════════════════════════════════════════════
 //  Main
 // ═════════════════════════════════════════════════════════════
@@ -199,7 +353,11 @@ async fn main() -> Result<()> {
         crane_core::models::DType::BF16
     };
     #[cfg(not(feature = "cuda"))]
-    let dtype = crane_core::models::DType::F32;
+    let dtype = if matches!(device, crane_core::models::Device::Metal(_)) {
+        crane_core::models::DType::F16  // Use F16 on Metal to save memory
+    } else {
+        crane_core::models::DType::F32
+    };
 
     let device_name = format!("{:?}", device);
     let dtype_name = format!("{:?}", dtype);
@@ -228,7 +386,37 @@ async fn main() -> Result<()> {
     // ── Branch: VLM model vs TTS model vs standard LLM ──
 
     let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, gemma4_vlm_tx_opt, tts_tx_opt):
-        (Option<EngineHandle>, tokenizers::Tokenizer, Vec<u32>, Box<dyn ChatTemplateProcessor>, Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>) = if is_tts {
+        (Option<EngineHandle>, tokenizers::Tokenizer, Vec<u32>, Box<dyn ChatTemplateProcessor>, Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>);
+
+    // Device-aware defaults for max_concurrent
+    let max_concurrent = args.max_concurrent.unwrap_or_else(|| {
+        // Get available memory in GB
+        let available_gb = get_available_memory() / (1024 * 1024 * 1024);
+
+        match device {
+            crane_core::models::Device::Metal(_) => {
+                // Metal on Apple Silicon: scale with memory and model size
+                // 3B model ~6GB, can handle 2-4 concurrent on 16GB system
+                // Formula: 1 concurrent per 4GB, capped at 4 for Metal
+                let base = (available_gb / 4).max(1) as usize;
+                base.min(4) // Cap at 4 for Metal (conservative)
+            }
+            crane_core::models::Device::Cpu => {
+                // CPU: scale with memory but more conservative
+                // 1 concurrent per 8GB
+                (available_gb / 8).max(1).min(4) as usize
+            }
+            _ => {
+                // CUDA/NVIDIA: higher baseline, scale with memory
+                // 1 concurrent per 2GB, capped at 16
+                (available_gb / 2).max(4).min(16) as usize
+            }
+        }
+    });
+    info!("Device-aware max_concurrent: {} (based on available memory)", max_concurrent);
+
+    // Split into branches based on model type
+    (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, gemma4_vlm_tx_opt, tts_tx_opt) = if is_tts {
         // TTS path: create Qwen3-TTS on a dedicated thread.
         info!("Loading TTS model (Qwen3-TTS) from: {}", args.model_path);
         let model_path_clone = args.model_path.clone();
@@ -592,6 +780,12 @@ async fn main() -> Result<()> {
         (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None)
     } else {
         // Standard LLM path.
+
+        // ── Pre-flight memory safety check ──
+        if let Err(e) = check_memory_safety(&args.model_path, &device, &dtype, args.ignore_memory_limit) {
+            return Err(anyhow::anyhow!("{}", e));
+        }
+
         let mut backend = engine::model_factory::create_backend(
             model_type, &args.model_path, &device, &dtype, format,
         )?;
@@ -627,7 +821,7 @@ async fn main() -> Result<()> {
 
         // ── Start engine on dedicated thread ──
         let (engine, handle) = InferenceEngine::new(
-            backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config,
+            backend, max_concurrent, args.decode_tokens_per_seq, memory_config,
         );
 
         std::thread::Builder::new()
@@ -636,7 +830,7 @@ async fn main() -> Result<()> {
             .expect("Failed to spawn engine thread");
         info!(
             "Inference engine started (max_concurrent={}, decode_tokens_per_seq={})",
-            args.max_concurrent, args.decode_tokens_per_seq,
+            max_concurrent, args.decode_tokens_per_seq,
         );
 
         (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None)
@@ -671,7 +865,7 @@ async fn main() -> Result<()> {
         device_name,
         host: args.host.clone(),
         port: args.port,
-        max_concurrent: args.max_concurrent,
+        max_concurrent,
         decode_tokens_per_seq: args.decode_tokens_per_seq,
         max_seq_len: args.max_seq_len,
         gpu_memory_limit: gpu_memory_limit_display,
@@ -704,7 +898,7 @@ async fn main() -> Result<()> {
             let mem_str = state.gpu_memory_limit.clone();
             println!("  Memory  : seq_len={seq_str}  gpu_limit={mem_str}");
         }
-        println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", args.max_concurrent, args.decode_tokens_per_seq);
+        println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", max_concurrent, args.decode_tokens_per_seq);
     }
     println!("  {sep2}");
     println!("  OpenAI-compatible API");

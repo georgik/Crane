@@ -206,6 +206,7 @@ pub async fn vlm_chat_completions(
                     delta: ChunkDelta {
                         role: Some("assistant".into()),
                         content: None,
+                        tool_calls: None,
                     },
                     finish_reason: None,
                 }],
@@ -228,6 +229,7 @@ pub async fn vlm_chat_completions(
                         delta: ChunkDelta {
                             role: None,
                             content: Some(text),
+                            tool_calls: None,
                         },
                         finish_reason: None,
                     }],
@@ -247,6 +249,7 @@ pub async fn vlm_chat_completions(
                     delta: ChunkDelta {
                         role: None,
                         content: None,
+                        tool_calls: None,
                     },
                     finish_reason: Some("stop".into()),
                 }],
@@ -284,7 +287,9 @@ pub async fn vlm_chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: ChatMessageContent::Text(result),
+                    content: Some(ChatMessageContent::Text(result)),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -458,7 +463,9 @@ pub async fn gemma4_vlm_chat_completions(
             index: 0,
             message: ChatMessage {
                 role: "assistant".into(),
-                content: ChatMessageContent::Text(result),
+                content: Some(ChatMessageContent::Text(result)),
+                tool_calls: None,
+                tool_call_id: None,
             },
             finish_reason: Some("stop".into()),
         }],

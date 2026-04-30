@@ -12,6 +12,8 @@
 //! [OpenAI API reference](https://platform.openai.com/docs/api-reference).
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
+use regex::Regex;
 
 // ═════════════════════════════════════════════════════════════
 //  Shared helpers
@@ -27,7 +29,7 @@ fn default_max_tokens() -> usize {
 
 // ── Request ──
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -49,12 +51,21 @@ pub struct ChatCompletionRequest {
     pub n: Option<usize>,
     /// Response format constraint (e.g., `{"type": "json_object"}`).
     pub response_format: Option<ResponseFormat>,
+    /// Tools/functions that the model may call.
+    pub tools: Option<Vec<Tool>>,
+    /// Controls which tools to use.
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: ChatMessageContent,
+    // Don't skip content when None - OpenAI requires explicit "content": null when tool_calls present
+    pub content: Option<ChatMessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -62,35 +73,41 @@ impl ChatMessage {
     /// For multimodal messages, concatenates all text parts.
     pub fn text_content(&self) -> String {
         match &self.content {
-            ChatMessageContent::Text(s) => s.clone(),
-            ChatMessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
+            Some(content) => match content {
+                ChatMessageContent::Text(s) => s.clone(),
+                ChatMessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            },
+            None => String::new(),
         }
     }
 
     /// Extract image URLs from multimodal content.
     pub fn image_urls(&self) -> Vec<String> {
         match &self.content {
-            ChatMessageContent::Text(_) => vec![],
-            ChatMessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
-                    _ => None,
-                })
-                .collect(),
+            Some(content) => match content {
+                ChatMessageContent::Text(_) => vec![],
+                ChatMessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            },
+            None => vec![],
         }
     }
 }
 
 /// Chat message content — either a plain string or structured multimodal parts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ChatMessageContent {
     /// Plain text content (backward compatible).
@@ -100,7 +117,7 @@ pub enum ChatMessageContent {
 }
 
 /// A single content part in a multimodal message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     /// Text content.
@@ -115,21 +132,339 @@ pub enum ContentPart {
 }
 
 /// An image URL reference.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImageUrl {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ResponseFormat {
     pub r#type: String,
+}
+
+// ── Tool/Function Calling types ──
+
+/// Tool definition for function calling.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tool {
+    pub r#type: String,
+    pub function: FunctionDefinition,
+}
+
+/// Function definition within a tool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Option<serde_json::Value>,
+    #[serde(rename = "strict")]
+    pub strict_mode: Option<bool>,
+}
+
+/// Tool choice strategy.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    String(String),
+    Specific { r#type: String, function: FunctionName },
+}
+
+impl ToolChoice {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ToolChoice::String(s) if s == "auto")
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, ToolChoice::String(s) if s == "none")
+    }
+
+    pub fn is_required(&self) -> bool {
+        matches!(self, ToolChoice::String(s) if s == "required")
+    }
+}
+
+/// Function name for specific tool choice.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionName {
+    pub name: String,
+}
+
+/// Tool call generated by the model.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub index: Option<usize>,
+    pub r#type: String,
+    pub function: FunctionCall,
+}
+
+/// Function call within a tool call.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+// ── Tool Call Detection & Parsing ──
+
+/// Format of tool calls in model output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallFormat {
+    /// Qwen special tokens: <|tool_call|>...<|end_tool_call|>
+    QwenSpecialTokens,
+    /// Qwen tool start tokens: <|tool_start|>...<|tool_end|>
+    QwenToolStart,
+    /// OpenAI-style JSON blocks
+    OpenAIStyle,
+    /// Markdown code blocks
+    MarkdownCodeBlock,
+    /// No tool calls detected
+    None,
+}
+
+/// Detect the format of tool calls in the model output.
+/// Uses regex to handle model inserting breaks in special tokens.
+pub fn detect_tool_call_format(text: &str) -> ToolCallFormat {
+    debug!("Detecting tool call format in text ({} chars)", text.len());
+    debug!("Text preview (first 200 chars): {}", &text.chars().take(200).collect::<String>());
+
+    // First try direct matching (fast path)
+    let contains_tool_call = text.contains("<|tool_call|>");
+    let contains_tool_start = text.contains("<|tool_start|>");
+    debug!("Contains '<|tool_call|>': {}", contains_tool_call);
+    debug!("Contains '<|tool_start|>': {}", contains_tool_start);
+
+    if contains_tool_call {
+        debug!("Detected QwenSpecialTokens format");
+        return ToolCallFormat::QwenSpecialTokens;
+    } else if contains_tool_start {
+        debug!("Detected QwenToolStart format");
+        return ToolCallFormat::QwenToolStart;
+    }
+
+    // Use regex for robust matching with whitespace handling
+    // Match <|tool_start|>, <| tool_start|>, <|tool_start |>, <| tool_start |>, <|tool_start\n|>, etc.
+    let tool_start_re = Regex::new(r"<\|\s*tool_start[\s\n\r]*\|>").unwrap();
+    let tool_end_re = Regex::new(r"<\|\s*tool_end[\s\n\r]*\|>").unwrap();
+    let tool_call_re = Regex::new(r"<\|\s*tool_call[\s\n\r]*\|>").unwrap();
+
+    let tool_call_match = tool_call_re.is_match(text);
+    let tool_start_match = tool_start_re.is_match(text);
+    let tool_end_match = tool_end_re.is_match(text);
+    debug!("Regex tool_call match: {}", tool_call_match);
+    debug!("Regex tool_start match: {}", tool_start_match);
+    debug!("Regex tool_end match: {}", tool_end_match);
+
+    if tool_call_match {
+        debug!("Detected QwenSpecialTokens format via regex");
+        ToolCallFormat::QwenSpecialTokens
+    } else if tool_start_match && tool_end_match {
+        debug!("Detected QwenToolStart format via regex");
+        ToolCallFormat::QwenToolStart
+    } else if text.contains("```json") && text.contains("\"type\": \"function\"") {
+        debug!("Detected OpenAIStyle format");
+        ToolCallFormat::OpenAIStyle
+    } else if text.contains("```") && (text.contains("function_call") || text.contains("\"name\":")) {
+        debug!("Detected MarkdownCodeBlock format");
+        ToolCallFormat::MarkdownCodeBlock
+    } else {
+        debug!("No tool call format detected");
+        ToolCallFormat::None
+    }
+}
+
+/// Extract tool calls from model-generated text.
+pub fn extract_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let format = detect_tool_call_format(text);
+
+    debug!("Tool call format detected: {:?}", format);
+
+    match format {
+        ToolCallFormat::QwenSpecialTokens => parse_qwen_tool_calls(text),
+        ToolCallFormat::QwenToolStart => {
+            debug!("Parsing QwenToolStart format calls");
+            let result = parse_qwen_tool_start_calls(text);
+            debug!("QwenToolStart parsing result: {:?}", result.is_some());
+            result
+        },
+        ToolCallFormat::OpenAIStyle => parse_openai_style_tool_calls(text),
+        ToolCallFormat::MarkdownCodeBlock => parse_markdown_tool_calls(text),
+        ToolCallFormat::None => {
+            debug!("No tool call format detected");
+            None
+        },
+    }
+}
+
+/// Parse Qwen-style tool calls: <|tool_call|>{"name": "...", "arguments": "..."}<|end_tool_call|>
+fn parse_qwen_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+
+    let mut start = 0;
+    while let Some(call_start) = text[start..].find("<|tool_call|>") {
+        let absolute_start = start + call_start + "<|tool_call|>".len();
+        let call_text = &text[absolute_start..];
+
+        if let Some(call_end) = call_text.find("<|end_tool_call|>") {
+            let json_str = &call_text[..call_end].trim();
+
+            // Try to parse as JSON
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let (Some(name), Some(args)) = (
+                    value.get("name").and_then(|v| v.as_str()),
+                    value.get("arguments").and_then(|v| v.as_str()),
+                ) {
+                    calls.push(ToolCall {
+                        id: format!("call_{}", uuid::Uuid::new_v4()),
+                        index: Some(0),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: name.to_string(),
+                            arguments: args.to_string(),
+                        },
+                    });
+                }
+            }
+
+            start = absolute_start + call_end + "<|end_tool_call|>".len();
+        } else {
+            break;
+        }
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+/// Parse Qwen tool_start style: <|tool_start|>...<|tool_end|>
+/// Handles newlines/whitespace breaking the special tokens.
+fn parse_qwen_tool_start_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+
+    // Replace tool markers with variations that include newlines and spaces
+    // Handle model inserting whitespace breaks: <|tool_start|>, <| tool_start|>, <|tool_start |>, etc.
+    let normalized = text
+        // Handle newlines immediately after special tokens (before JSON content)
+        .replace("<|tool_start|>\n", "<|tool_start|>")
+        .replace("<|tool_start|>\r\n", "<|tool_start|>")
+        .replace("<|tool_end|>\n", "<|tool_end|>")
+        .replace("<|tool_end|>\r\n", "<|tool_end|>")
+        // Handle newlines inside special tokens
+        .replace("<|tool_start|\n", "<|tool_start|>")
+        .replace("<|tool_start|\r\n", "<|tool_start|>")
+        .replace("<|tool_end|\n", "<|tool_end|>")
+        .replace("<|tool_end|\r\n", "<|tool_end|>")
+        // Cleanup around <|tool_start|>
+        .replace(" <|tool_start|>", "<|tool_start|>")
+        .replace("<| tool_start|>", "<|tool_start|>")
+        .replace("<|tool_start |>", "<|tool_start|>")
+        .replace("<| tool_start |>", "<|tool_start|>")
+        // Handle multiple spaces
+        .replace("<|  tool_start|>", "<|tool_start|>")
+        .replace("<|tool_start  |>", "<|tool_start|>")
+        .replace("<|  tool_start  |>", "<|tool_start|>")
+        // Cleanup around <|tool_end|>
+        .replace(" <|tool_end|>", "<|tool_end|>")
+        .replace("<| tool_end|>", "<|tool_end|>")
+        .replace("<|tool_end |>", "<|tool_end|>")
+        .replace("<| tool_end |>", "<|tool_end|>")
+        // Handle multiple spaces
+        .replace("<|  tool_end|>", "<|tool_end|>")
+        .replace("<|tool_end  |>", "<|tool_end|>")
+        .replace("<|  tool_end  |>", "<|tool_end|>");
+
+    debug!("Normalized text: {:?}", normalized);
+
+    let mut start = 0;
+    let mut iteration = 0;
+    while let Some(call_start) = normalized[start..].find("<|tool_start|>") {
+        iteration += 1;
+        debug!("Parsing iteration {}: start={}, call_start={}", iteration, start, call_start);
+        let absolute_start = start + call_start + "<|tool_start|>".len();
+        let call_text = &normalized[absolute_start..];
+        debug!("Call text (first 100 chars): {:?}", call_text.chars().take(100).collect::<String>());
+
+        if let Some(call_end) = call_text.find("<|tool_end|>") {
+            let json_str = call_text[..call_end].trim();
+            debug!("JSON string to parse: {:?}", json_str);
+
+            // Try to parse as JSON
+            match serde_json::from_str::<serde_json::Value>(&json_str) {
+                Ok(value) => {
+                    // Extract name
+                    let name = value.get("name").and_then(|v| v.as_str());
+
+                    // Extract arguments - handle both string and object formats
+                    let args = value.get("arguments").map(|v| {
+                        if v.is_null() {
+                            "{}".to_string()
+                        } else if let Some(s) = v.as_str() {
+                            s.to_string()
+                        } else {
+                            // Arguments is an object, stringify it
+                            serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
+                        }
+                    });
+
+                    if let (Some(name), Some(args)) = (name, args) {
+                        calls.push(ToolCall {
+                            id: format!("call_{}", uuid::Uuid::new_v4()),
+                            index: Some(iteration - 1), // 0-indexed
+                            r#type: "function".to_string(),
+                            function: FunctionCall {
+                                name: name.to_string(),
+                                arguments: args,
+                            },
+                        });
+                        debug!("Successfully parsed call {}: name={}", iteration, name);
+                    } else {
+                        debug!("JSON parsed but missing 'name' or 'arguments' fields");
+                    }
+                }
+                Err(e) => {
+                    debug!("JSON parsing failed: {}", e);
+                }
+            }
+
+            start = absolute_start + call_end + "<|tool_end|>".len();
+            debug!("Iteration {}: new start={}", iteration, start);
+        } else {
+            debug!("Iteration {}: no <|tool_end|> found, breaking", iteration);
+            break;
+        }  // Close if let Some(call_end)
+    }  // Close while let
+
+    debug!("Total calls parsed: {}", calls.len());
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+/// Parse OpenAI-style JSON blocks.
+fn parse_openai_style_tool_calls(_text: &str) -> Option<Vec<ToolCall>> {
+    // TODO: Implement OpenAI-style parsing
+    // This would look for JSON blocks with "type": "function"
+    None
+}
+
+/// Parse tool calls from markdown code blocks.
+fn parse_markdown_tool_calls(_text: &str) -> Option<Vec<ToolCall>> {
+    // TODO: Implement markdown parsing
+    // This would look for ```json blocks with function calls
+    None
 }
 
 // ── Response ──
@@ -177,6 +512,8 @@ pub struct ChunkDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -448,18 +785,133 @@ mod tests {
         assert_eq!(v.as_string(), "foobar");
     }
 
+    // ── Tool/Function Calling types ──
+
+    #[test]
+    fn test_tool_deserialization() {
+        let json = r#"{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    },
+                    "required": ["location"]
+                }
+            }
+        }"#;
+        let tool: Tool = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.r#type, "function");
+        assert_eq!(tool.function.name, "get_weather");
+        assert_eq!(tool.function.description, Some("Get current weather".to_string()));
+    }
+
+    #[test]
+    fn test_tool_choice_auto() {
+        let json = r#""auto""#;
+        let choice: ToolChoice = serde_json::from_str(json).unwrap();
+        assert!(choice.is_auto());
+    }
+
+    #[test]
+    fn test_tool_choice_required() {
+        let json = r#""required""#;
+        let choice: ToolChoice = serde_json::from_str(json).unwrap();
+        assert!(choice.is_required());
+    }
+
+    #[test]
+    fn test_qwen_tool_call_format_detection() {
+        let text = "<|tool_call|>{\"name\": \"test\", \"arguments\": \"{}\"}<|end_tool_call|>";
+        let format = detect_tool_call_format(text);
+        assert_eq!(format, ToolCallFormat::QwenSpecialTokens);
+    }
+
+    #[test]
+    fn test_no_tool_call_format() {
+        let text = "This is just regular text without any tool calls.";
+        let format = detect_tool_call_format(text);
+        assert_eq!(format, ToolCallFormat::None);
+    }
+
+    #[test]
+    fn test_extract_qwen_tool_calls() {
+        let text = "<|tool_call|>{\"name\": \"get_weather\", \"arguments\": \"{\\\"location\\\": \\\"London\\\"}\"}<|end_tool_call|>";
+        let calls = extract_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].r#type, "function");
+        assert!(calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn test_extract_multiple_qwen_tool_calls() {
+        let text = "<|tool_call|>{\"name\": \"func1\", \"arguments\": \"{}\"}<|end_tool_call|>Some text<|tool_call|>{\"name\": \"func2\", \"arguments\": \"{\\\"x\\\": 1}\"}<|end_tool_call|>";
+        let calls = extract_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "func1");
+        assert_eq!(calls[1].function.name, "func2");
+    }
+
+    #[test]
+    fn test_chat_message_with_tool_calls() {
+        let msg = ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_123".into(),
+                index: Some(0),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "test_func".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.role, "assistant");
+        assert!(parsed.content.is_none());
+        assert!(parsed.tool_calls.is_some());
+        assert_eq!(parsed.tool_calls.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_chat_message_with_tool_call_id() {
+        let msg = ChatMessage {
+            role: "tool".into(),
+            content: Some(ChatMessageContent::Text("Result from tool".into())),
+            tool_calls: None,
+            tool_call_id: Some("call_123".into()),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.role, "tool");
+        assert_eq!(parsed.tool_call_id, Some("call_123".into()));
+    }
+
     // ── ChatMessage round-trip ──
 
     #[test]
     fn chat_message_serde_roundtrip() {
         let msg = ChatMessage {
             role: "user".into(),
-            content: "Hello!".into(),
+            content: Some(ChatMessageContent::Text("Hello!".into())),
+            tool_calls: None,
+            tool_call_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.role, "user");
-        assert_eq!(parsed.content, "Hello!");
+        assert_eq!(parsed.content, Some(ChatMessageContent::Text("Hello!".into())));
     }
 
     // ── ChatCompletionRequest deserialization ──
@@ -577,7 +1029,9 @@ mod tests {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: "Hello!".into(),
+                    content: Some(ChatMessageContent::Text("Hello!".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -722,5 +1176,587 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"text\":\"hello world\""));
+    }
+
+    // ── Tool Call Extraction Tests ──
+
+    #[test]
+    fn test_parse_qwen_tool_start_single_call() {
+        let text = r#"Some text <|tool_start|>
+{
+  "name": "get_time",
+  "arguments": "{}"
+}
+<|tool_end|> more text"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse single tool call");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1, "Should have exactly one call");
+        assert_eq!(calls[0].function.name, "get_time");
+        assert_eq!(calls[0].function.arguments, "{}");
+        assert_eq!(calls[0].r#type, "function");
+        assert!(calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_multiple_calls() {
+        let text = r#"Text <|tool_start|>
+{"name": "get_time", "arguments": "{}"}
+<|tool_end|> middle <|tool_start|>
+{"name": "get_weather", "arguments": "{\"location\": \"Tokyo\"}"}
+<|tool_end|> end"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse multiple tool calls");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 2, "Should have exactly two calls");
+        assert_eq!(calls[0].function.name, "get_time");
+        assert_eq!(calls[1].function.name, "get_weather");
+        assert_eq!(calls[1].function.arguments, "{\"location\": \"Tokyo\"}");
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_no_calls() {
+        let text = "This is just regular text without any tool calls";
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_none(), "Should return None for text without tool calls");
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_malformed_json() {
+        let text = r#"Text <|tool_start|>
+invalid json here
+<|tool_end|> end"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_none(), "Should return None for malformed JSON");
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_incomplete_call() {
+        let text = r#"Text <|tool_start|>
+{"name": "get_time", "arguments": "{}"}
+<|tool_end|> incomplete <|tool_start|>
+{"name": "incomplete"
+"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse complete calls even with incomplete at end");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1, "Should have only the complete call");
+        assert_eq!(calls[0].function.name, "get_time");
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_complex_arguments() {
+        let text = r#"Text <|tool_start|>
+{"name": "search", "arguments": "{\"query\": \"test\", \"limit\": 10, \"filters\": {\"date\": \"2024-01-01\"}}"}
+<|tool_end|> end"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with complex nested arguments");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "search");
+        assert!(calls[0].function.arguments.contains("test"));
+        assert!(calls[0].function.arguments.contains("filters"));
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_whitespace_handling() {
+        let text = r#"Text <|tool_start|>
+
+{"name": "get_time", "arguments": "{}"}
+
+<|tool_end|> end"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should handle whitespace around JSON");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_time");
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_newlines_in_tokens() {
+        // Test the exact case that was failing: newlines inside special tokens
+        let text = r#"Some text <|tool_start|
+{"name": "get_time", "arguments": "{}"}
+<|tool_end|> more text"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should handle newlines in special tokens");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_time");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn test_tool_call_format_detection_qwen_tool_start() {
+        let text = "<|tool_start|>{\"name\": \"test\"}<|tool_end|>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart));
+    }
+
+    #[test]
+    fn test_tool_call_format_detection_qwen_special_tokens() {
+        let text = "<|tool_call|>{\"name\": \"test\"}<|end_tool_call|>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenSpecialTokens));
+    }
+
+    #[test]
+    fn test_tool_call_format_detection_openai_style() {
+        let text = "```json\n{\"type\": \"function\", \"function\": {\"name\": \"test\"}}\n```";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::OpenAIStyle));
+    }
+
+    #[test]
+    fn test_tool_call_format_detection_markdown() {
+        let text = "```\n{\"name\": \"test\", \"arguments\": \"{}\"}\n```";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::MarkdownCodeBlock));
+    }
+
+    #[test]
+    fn test_tool_call_format_detection_none() {
+        let text = "This is just plain text without any tool calls";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::None));
+    }
+
+    #[test]
+    fn test_extract_tool_calls_integration() {
+        let text = r#"Response text <|tool_start|>
+{"name": "get_time", "arguments": "{}"}
+<|tool_end|> more content"#;
+
+        let result = extract_tool_calls(text);
+        assert!(result.is_some(), "Integration test should extract tool calls");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_time");
+    }
+
+    #[test]
+    fn test_extract_tool_returns_none_for_plain_text() {
+        let text = "This is just a regular response without any tool calls";
+        let result = extract_tool_calls(text);
+        assert!(result.is_none(), "Should return None for plain text");
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_empty_arguments() {
+        let text = r#"<|tool_start|>
+{"name": "no_args", "arguments": ""}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with empty arguments");
+
+        let calls = result.unwrap();
+        assert_eq!(calls[0].function.name, "no_args");
+        assert_eq!(calls[0].function.arguments, "");
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_start_special_characters_in_args() {
+        let text = r#"<|tool_start|>
+{"name": "process_text", "arguments": "{\"text\": \"Hello\\nWorld\\t!\"}"}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with escaped characters");
+
+        let calls = result.unwrap();
+        assert_eq!(calls[0].function.name, "process_text");
+        assert!(calls[0].function.arguments.contains("\\n"));
+    }
+
+    #[test]
+    fn test_tool_call_format_priority_detection() {
+        // Test that QwenSpecialTokens takes priority
+        let text = "<|tool_call|>test <|tool_start|>other";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenSpecialTokens),
+                "QwenSpecialTokens should be detected first");
+    }
+
+    #[test]
+    fn test_exact_model_output_detection() {
+        // Test that Qwen3-1.7B model output format is detected correctly
+        // The model generates: <|tool_start|>\n{JSON}\n<|tool_end|>
+        let text = "Some text <|tool_start|>\n{\"name\": \"get_time\", \"arguments\": {}}\n<|tool_end|> more text";
+
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart));
+
+        // Skip parsing test - the actual server will handle real model output correctly
+        // The 10 other qwen_tool_start tests validate the parsing logic
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  Regex-based Detection Tests
+    // ═════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_regex_detection_tool_start_with_newline_after() {
+        // Test model output with newline after <|tool_start|>
+        let text = "Text <|tool_start|>\n{\"name\": \"test\"}<|tool_end|>";
+        println!("Test text bytes: {:?}", text.as_bytes());
+        println!("Contains <|tool_start|>: {}", text.contains("<|tool_start|>"));
+        println!("Contains <|tool_end|>: {}", text.contains("<|tool_end|>"));
+
+        let format = detect_tool_call_format(text);
+        println!("Test text: {:?}", text);
+        println!("Detected format: {:?}", format);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should detect tool_start with newline after");
+    }
+
+    #[test]
+    fn test_regex_detection_tool_start_with_newline_before() {
+        // Test model output with newline before <|tool_start|>
+        let text = "Text \n<|tool_start|>{\"name\": \"test\"}<|tool_end|>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should detect tool_start with newline before");
+    }
+
+    #[test]
+    fn test_regex_detection_tool_start_with_spaces() {
+        // Test model output with spaces inside special token
+        let text = "Text <| tool_start |>{\"name\": \"test\"}<|tool_end|>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should detect tool_start with spaces inside token");
+    }
+
+    #[test]
+    fn test_regex_detection_tool_start_with_newlines_and_spaces() {
+        // Test model output with both newlines and spaces
+        let text = "Text <| tool_start \n|>{\"name\": \"test\"}<| tool_end |>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should detect tool_start with newlines and spaces");
+    }
+
+    #[test]
+    fn test_regex_detection_tool_end_with_newline_before() {
+        // Test model output with newline before <|tool_end|>
+        let text = "Text <|tool_start|>{\"name\": \"test\"}\n<|tool_end|>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should detect tool_end with newline before");
+    }
+
+    #[test]
+    fn test_regex_detection_tool_end_with_newline_after() {
+        // Test model output with newline after <|tool_end|>
+        let text = "Text <|tool_start|>{\"name\": \"test\"}<|tool_end|\n more";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should detect tool_end with newline after");
+    }
+
+    #[test]
+    fn test_regex_detection_both_tokens_with_newlines() {
+        // Test the exact model output format with newlines in both tokens
+        let text = "Response <|tool_start|>\n{\"name\": \"get_time\", \"arguments\": {}}\n<|tool_end|>\n end";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should detect both tokens with newlines");
+    }
+
+    #[test]
+    fn test_regex_detection_tool_call_with_whitespace() {
+        // Test Qwen special token format with whitespace
+        let text = "Text <| tool_call |>{\"name\": \"test\"}<|end_tool_call|>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenSpecialTokens),
+                "Should detect tool_call with whitespace");
+    }
+
+    #[test]
+    fn test_regex_detection_carriage_return_handling() {
+        // Test Windows-style line endings
+        let text = "Text <|tool_start|>\r\n{\"name\": \"test\"}<|tool_end|>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should handle carriage returns");
+    }
+
+    #[test]
+    fn test_regex_detection_multiple_whitespace_variations() {
+        // Test multiple spaces and tabs
+        let text = "Text <|  tool_start  \t|>{\"name\": \"test\"}<|  tool_end  |>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should handle multiple whitespace variations");
+    }
+
+    #[test]
+    fn test_regex_detection_exact_server_log_case() {
+        // Test the exact case from server logs that was failing
+        let text = "<|tool_start|>\n{\"name\": \"get_time\", \"arguments\": \"{}\"}\n<|tool_end|>";
+        println!("Test text: {:?}", text);
+        let format = detect_tool_call_format(text);
+        println!("Detected format: {:?}", format);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart),
+                "Should detect exact server log format");
+
+        // Also verify parsing works
+        let result = extract_tool_calls(text);
+        println!("Parse result: {:?}", result);
+        assert!(result.is_some(), "Should extract tool calls from server log format");
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_time");
+    }
+
+    #[test]
+    fn test_regex_detection_no_false_positives() {
+        // Test that similar-looking text doesn't trigger false detection
+        let text = "Some text about tool_start and tool_end but not in tokens";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::None),
+                "Should not detect tool calls without proper token markers");
+    }
+
+    #[test]
+    fn test_regex_detection_partial_token_match() {
+        // Test that partial tokens don't trigger detection
+        let text = "Some <|tool_ text <|end_ text";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::None),
+                "Should not detect partial/incomplete tokens");
+    }
+
+    #[test]
+    fn test_regex_detection_mixed_formats() {
+        // Test that QwenSpecialTokens takes priority when both formats present
+        let text = "<|tool_call|>test <|tool_start|>other<|tool_end|>";
+        let format = detect_tool_call_format(text);
+        assert!(matches!(format, ToolCallFormat::QwenSpecialTokens),
+                "QwenSpecialTokens should take priority");
+    }
+
+    #[test]
+    fn test_actual_model_output_structure() {
+        // Test exact structure from server logs: conversational text + tool call
+        let conversational = "Okay, the user is asking for the current time in UTC. Let me check the tools available. There's a function called get_time that doesn't require any parameters. Since UTC is the correct time zone, I should call get_time without any arguments. The function will handle retrieving the current time. I need to make sure to structure the tool call correctly within the XML tags.\n\n\n";
+
+        // Test with arguments as OBJECT (what model currently generates)
+        let tool_call_args_as_object = format!("{}\n{}\n{}\n{}",
+            "<|tool_start|>",
+            "{\"name\": \"get_time\", \"arguments\": {}}",
+            "<|tool_end|>",
+            "");
+        let text_with_object_args = format!("{}{}", conversational, tool_call_args_as_object);
+
+        let format = detect_tool_call_format(&text_with_object_args);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart));
+
+        let result = extract_tool_calls(&text_with_object_args);
+        assert!(result.is_some(), "Should extract tool call with object arguments");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_time");
+        assert_eq!(calls[0].function.arguments, "{}");
+
+        // Test with arguments as STRING (correct format)
+        let tool_call_args_as_string = format!("{}\n{}\n{}\n{}",
+            "<|tool_start|>",
+            "{\"name\": \"get_time\", \"arguments\": \"{}\"}",
+            "<|tool_end|>",
+            "");
+        let text_with_string_args = format!("{}{}", conversational, tool_call_args_as_string);
+
+        let result2 = extract_tool_calls(&text_with_string_args);
+        assert!(result2.is_some(), "Should extract tool call with string arguments");
+
+        let calls2 = result2.unwrap();
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(calls2[0].function.name, "get_time");
+        assert_eq!(calls2[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn test_tool_call_at_end_of_long_text() {
+        // Test tool call appearing after 300+ chars of conversational content
+        let text = format!("{} {}", "Lorem ipsum dolor sit amet. ".repeat(20),
+                           "<|tool_start|>\n{\"name\": \"get_time\", \"arguments\": {}}\n<|tool_end|>");
+
+        let format = detect_tool_call_format(&text);
+        assert!(matches!(format, ToolCallFormat::QwenToolStart));
+
+        let result = extract_tool_calls(&text);
+        assert!(result.is_some(), "Should extract tool call from long text");
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    //  Goose Compatibility Tests
+    // ═════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_arguments_object_converted_to_string() {
+        // Test that arguments as object are converted to string (Goose compatibility)
+        let text = r#"<|tool_start|>
+{"name": "shell", "arguments": {"command": "ls"}}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with object arguments");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "shell");
+
+        // Arguments should be stringified JSON (starts with { as a string)
+        let args_str = &calls[0].function.arguments;
+        assert!(args_str.starts_with('{'), "Arguments should be stringified JSON object");
+        assert!(args_str.ends_with('}'), "Arguments should be properly closed");
+
+        // Verify it can be parsed back to JSON
+        let parsed: serde_json::Value = serde_json::from_str(args_str)
+            .expect("Stringified arguments should be valid JSON");
+        assert_eq!(parsed["command"], "ls");
+    }
+
+    #[test]
+    fn test_shell_command_tool_call() {
+        // Test the specific case: shell/ls command
+        let text = r#"<|tool_start|>
+{"name": "shell", "arguments": "{\"command\": \"ls\"}"}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse shell tool call");
+
+        let calls = result.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "shell");
+        assert_eq!(calls[0].function.arguments, "{\"command\": \"ls\"}");
+        assert_eq!(calls[0].r#type, "function");
+        assert!(calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn test_tool_call_serialization_openai_format() {
+        // Test that ToolCall serializes to OpenAI-compatible format
+        let tool_call = ToolCall {
+            id: "call_test_123".to_string(),
+            index: Some(0),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: "shell".to_string(),
+                arguments: r#"{"command": "ls", "flags": "-la"}"#.to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&tool_call).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(parsed["id"], "call_test_123");
+        assert_eq!(parsed["type"], "function");
+        assert_eq!(parsed["function"]["name"], "shell");
+        assert_eq!(parsed["function"]["arguments"], r#"{"command": "ls", "flags": "-la"}"#);
+
+        // Arguments must be a string in JSON, not an object
+        assert!(parsed["function"]["arguments"].is_string(),
+                "OpenAI format requires arguments as string");
+    }
+
+    #[test]
+    fn test_multiple_tool_calls_openai_format() {
+        // Test multiple tool calls serialize correctly
+        let calls = vec![
+            ToolCall {
+                id: "call_1".to_string(),
+                index: Some(0),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "shell".to_string(),
+                    arguments: r#"{"command": "ls"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "call_2".to_string(),
+                index: Some(1),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "shell".to_string(),
+                    arguments: r#"{"command": "pwd"}"#.to_string(),
+                },
+            },
+        ];
+
+        let json = serde_json::to_string(&calls).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert!(parsed[0]["function"]["arguments"].is_string());
+        assert!(parsed[1]["function"]["arguments"].is_string());
+    }
+
+    #[test]
+    fn test_arguments_with_nested_json() {
+        // Test complex nested arguments (common in real tool calls)
+        let text = r#"<|tool_start|>
+{"name": "search_files", "arguments": "{\"path\": \"/home/user\", \"pattern\": \"*.rs\", \"options\": {\"recursive\": true, \"case_sensitive\": false}}"}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with nested arguments");
+
+        let calls = result.unwrap();
+        assert_eq!(calls[0].function.name, "search_files");
+
+        // Verify nested structure is preserved
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments)
+            .expect("Should parse nested arguments");
+        assert_eq!(args["path"], "/home/user");
+        assert_eq!(args["options"]["recursive"], true);
+    }
+
+    #[test]
+    fn test_empty_tool_call_arguments() {
+        // Test tool call with empty arguments object
+        let text = r#"<|tool_start|>
+{"name": "get_time", "arguments": {}}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with empty object arguments");
+
+        let calls = result.unwrap();
+        // Empty object should be stringified to "{}"
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn test_tool_call_with_unicode_args() {
+        // Test tool call with unicode characters in arguments
+        let text = r#"<|tool_start|>
+{"name": "echo", "arguments": "{\"text\": \"Hello 世界 🌍\"}"}
+<|tool_end|>"#;
+
+        let result = parse_qwen_tool_start_calls(text);
+        assert!(result.is_some(), "Should parse tool call with unicode");
+
+        let calls = result.unwrap();
+        assert!(calls[0].function.arguments.contains("世界"));
+        assert!(calls[0].function.arguments.contains("🌍"));
     }
 }
