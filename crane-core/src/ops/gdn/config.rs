@@ -133,6 +133,27 @@ pub mod defaults {
     pub fn full_attention_interval() -> usize {
         4
     }
+
+    /// Absent in dense checkpoints; Ornith (and every Qwen3_5 MoE) sets it.
+    /// Zero means "no experts" — the block is a plain dense MLP.
+    pub fn num_experts() -> usize {
+        0
+    }
+
+    /// `num_experts_per_tok` defaults to the standard grouped-MoE top-k of 8.
+    pub fn num_experts_per_tok() -> usize {
+        8
+    }
+
+    /// Expert FFN width; absent in dense checkpoints (zero → no MoE path).
+    pub fn moe_intermediate_size() -> usize {
+        0
+    }
+
+    /// Shared-expert FFN width; absent in dense checkpoints (zero → none).
+    pub fn shared_expert_intermediate_size() -> usize {
+        0
+    }
 }
 
 /// Marker type used by model configs that deserialize nested blocks with

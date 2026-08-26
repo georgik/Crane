@@ -68,6 +68,18 @@ pub struct TextConfig {
     pub linear_num_key_heads: usize,
     pub linear_num_value_heads: usize,
 
+    // Mixture-of-experts parameters. Dense checkpoints (Qwen 3.6/8 27B) omit
+    // these entirely; Ornith (and every Qwen3_5 MoE) sets them. `num_experts = 0`
+    // means the block is a plain dense MLP, so every dense path below stays valid.
+    #[serde(default = "defaults::num_experts")]
+    pub num_experts: usize,
+    #[serde(default = "defaults::num_experts_per_tok")]
+    pub num_experts_per_tok: usize,
+    #[serde(default = "defaults::moe_intermediate_size")]
+    pub moe_intermediate_size: usize,
+    #[serde(default = "defaults::shared_expert_intermediate_size")]
+    pub shared_expert_intermediate_size: usize,
+
     #[serde(default)]
     pub tie_word_embeddings: bool,
 

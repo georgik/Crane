@@ -279,6 +279,16 @@ impl Qwen3_5TextModel {
             linear_value_head_dim: inner_size / num_v_heads,
             linear_num_key_heads: md_u32(&gg, "ssm.group_count")?,
             linear_num_value_heads: num_v_heads,
+            // Present only in MoE checkpoints (Ornith / Qwen3_5-MoE); dense
+            // qwen3_5/6/8 leave these absent → 0 → block stays a plain MLP.
+            num_experts: md_u32_or(&gg, &format!("{arch}.expert_count"), 0),
+            num_experts_per_tok: md_u32_or(&gg, &format!("{arch}.expert_used_count"), 8),
+            moe_intermediate_size: md_u32_or(&gg, &format!("{arch}.expert_feed_forward_length"), 0),
+            shared_expert_intermediate_size: md_u32_or(
+                &gg,
+                &format!("{arch}.expert_shared_feed_forward_length"),
+                0,
+            ),
             tie_word_embeddings,
             attn_output_gate,
             // GGUF carries no gate-activation key; the conversion only ever
