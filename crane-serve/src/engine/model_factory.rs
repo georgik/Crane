@@ -433,8 +433,11 @@ fn detect_from_gguf_header(path: &Path) -> Option<ModelType> {
     match arch.as_str() {
         // llama.cpp writes "qwen35" for Qwen 3.5, 3.6 and 3.8 alike; the
         // 36/38 spellings guard against a future converter renaming it.
-        "qwen35" | "qwen3_5" | "qwen3.5" | "qwen36" | "qwen3_6" | "qwen3.6" | "qwen38"
-        | "qwen3_8" | "qwen3.8" => Some(ModelType::Qwen3_5),
+        // `qwen35moe` is the MoE variant of Qwen 3.5 (Ornith-1.5); it shares the
+        // qwen3_5 hybrid base architecture and routes through the same module, so
+        // it must sit in this arm — bare `qwen3moe` is a different backend.
+        "qwen35" | "qwen35moe" | "qwen3_5" | "qwen3.5" | "qwen36" | "qwen3_6"
+        | "qwen3.6" | "qwen38" | "qwen3_8" | "qwen3.8" => Some(ModelType::Qwen3_5),
         "qwen3" | "qwen3moe" => Some(ModelType::Qwen3),
         "qwen2" => Some(ModelType::Qwen25),
         a if a.starts_with("hunyuan") => Some(ModelType::HunyuanDense),

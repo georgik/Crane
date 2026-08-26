@@ -20,6 +20,29 @@ pub enum LinearLayer {
     Quantized(QMatMul),
 }
 
+impl LinearLayer {
+    /// The underlying weight tensor, if this layer carries one (quantized layers
+    /// expose no dense weight — they hold a compressed `QMatMul`). Used by the
+    /// per-layer multi-GPU splitter to reconstruct weights on another device.
+    #[must_use]
+    pub fn weight(&self) -> Option<&Tensor> {
+        match self {
+            Self::Standard(l) => Some(&l.weight()),
+            Self::Quantized(_) => None,
+        }
+    }
+
+    /// The underlying bias tensor, if any. Only Standard (non-quantized) layers
+    /// can carry a bias.
+    #[must_use]
+    pub fn bias(&self) -> Option<&Tensor> {
+        match self {
+            Self::Standard(l) => l.bias(),
+            Self::Quantized(_) => None,
+        }
+    }
+}
+
 impl Module for LinearLayer {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
