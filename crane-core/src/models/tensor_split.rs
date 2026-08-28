@@ -41,6 +41,31 @@ pub fn devices_equal(a: &Device, b: &Device) -> bool {
 /// layers on each GPU.
 pub const DEFAULT_SPLIT_RATIO: f32 = 0.5;
 
+/// Synchronize a device's compute stream before a cross-device copy.
+///
+/// candle's Cuda→Cuda `to_device` copy (`CudaStorage::transfer_to_device`) is
+/// enqueued on the *destination* stream only — nothing orders it against the
+/// source device's pending kernels. On a whole-layer split the boundary copy
+/// can therefore ship activations before the previous GPU finished writing
+/// them, which surfaces downstream as intermittent NaN logits (the sampler
+/// rejects them with `A weight is negative, too large or not a valid number`).
+/// Draining the source stream first closes that race; the cost is one stream
+/// drain per boundary per forward pass.
+///
+/// # Errors
+///
+/// Returns an error if the CUDA stream cannot be synchronized.
+pub fn sync_device_stream(device: &Device) -> Result<()> {
+    match device {
+        Device::Cuda(d) => {
+            use candle_core::cuda_backend::WrapErr;
+            d.cuda_stream().synchronize().w()?;
+            Ok(())
+        },
+        _ => Ok(()),
+    }
+}
+
 /// Parse a `g0:g1` device-id pair into CUDA ordinals, validating that exactly
 /// two *distinct* GPUs are named.
 pub fn parse_gpu_ids(raw: &str) -> Result<[usize; 2]> {

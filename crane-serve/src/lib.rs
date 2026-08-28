@@ -86,6 +86,12 @@ pub struct Args {
     /// default; this is an opt-out, not the default.
     #[arg(long)]
     pub text_only: bool,
+    /// Whole-layer multi-GPU split (Qwen 3.5 GGUF only): run decoder layers
+    /// across two CUDA devices, e.g. `--gpu-ids 0,1`. Falls back to the
+    /// `CRANE_GPU_IDS` environment variable when unset. Activations are copied
+    /// between devices at the layer boundary; see `crane_core::models::tensor_split`.
+    #[arg(long)]
+    pub gpu_ids: Option<String>,
 }
 
 pub struct AppState {
@@ -467,6 +473,62 @@ fn apply_text_only_override(
     } else {
         (model_type, resolved_type)
     }
+}
+
+/// Resolve the whole-layer multi-GPU split request: `--gpu-ids` wins over the
+/// `CRANE_GPU_IDS` environment variable; `None` means load on a single device.
+/// A requested split is validated up front (CUDA present, text Qwen 3.5, GGUF
+/// checkpoint) so an unsplittable model errors out instead of silently
+/// degrading to a single-GPU load.
+fn resolve_split_devices(
+    args: &Args,
+    resolved_type: ModelType,
+    format: ModelFormat,
+) -> Result<Option<(crane_core::models::Device, crane_core::models::Device)>> {
+    use crane_core::models::tensor_split::parse_gpu_ids;
+
+    let Some(ids_raw) = args.gpu_ids.clone().or_else(|| std::env::var("CRANE_GPU_IDS").ok())
+    else {
+        return Ok(None);
+    };
+    if args.cpu {
+        anyhow::bail!(
+            "--gpu-ids/CRANE_GPU_IDS requests a multi-GPU split but --cpu was passed"
+        );
+    }
+    if !crane_core::utils::cuda_is_available() {
+        anyhow::bail!(
+            "--gpu-ids/CRANE_GPU_IDS requests a multi-GPU split but no CUDA device is \
+             available (build with --features cuda and expose both GPUs)"
+        );
+    }
+    if resolved_type != ModelType::Qwen3_5 {
+        anyhow::bail!(
+            "multi-GPU split is currently only supported for Qwen 3.5 text models, \
+             got {resolved_type:?}"
+        );
+    }
+    let is_gguf = format == ModelFormat::Gguf
+        || (format == ModelFormat::Auto
+            && std::path::Path::new(&args.model_path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf")));
+    if !is_gguf {
+        anyhow::bail!(
+            "multi-GPU split loads quantized GGUF checkpoints directly; '{}' is not a \
+             .gguf file (pass a GGUF path or --format gguf)",
+            args.model_path
+        );
+    }
+    let [a, b] = parse_gpu_ids(&ids_raw)?;
+    info!(
+        "Multi-GPU split requested: decoder layers split across CUDA devices {} and {}",
+        a, b
+    );
+    Ok(Some((
+        crane_core::models::Device::new_cuda(a)?,
+        crane_core::models::Device::new_cuda(b)?,
+    )))
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -1083,6 +1145,7 @@ pub async fn run(args: Args) -> Result<()> {
     } else {
         // Only one of the TTS/ASR/VLM/LLM branches runs per process, so each is
         // the sole long-lived consumer of candle's process-wide rayon pool.
+        let split_devices = resolve_split_devices(&args, resolved_type, format)?;
         let mut backend = engine::model_factory::create_backend(
             model_type,
             &args.model_path,
@@ -1090,6 +1153,9 @@ pub async fn run(args: Args) -> Result<()> {
             &dtype,
             format,
             args.quant.as_deref(),
+            split_devices
+                .as_ref()
+                .map(|(layer_a, layer_b)| (layer_a, layer_b)),
         )?;
         info!(
             "Model loaded successfully (type: {:?}, format: {:?})",

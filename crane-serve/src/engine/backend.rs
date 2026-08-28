@@ -548,6 +548,23 @@ impl Qwen3_5Backend {
             dtype: *dtype,
         })
     }
+
+    /// Load a GGUF checkpoint whose decoder is split across two CUDA devices
+    /// (whole layers on GPU 0 vs GPU 1; see [`crate::models::tensor_split`]).
+    /// GGUF only — in-situ quantization is a no-op for GGUF and whole-layer
+    /// splitting needs the raw quantized bytes as read from disk.
+    pub fn new_split(
+        model_path: &str,
+        layer_a: &Device,
+        layer_b: &Device,
+        dtype: &DType,
+    ) -> Result<Self> {
+        let model = crane_core::models::qwen3_5::Model::from_gguf_split(model_path, layer_a.clone(), layer_b.clone())?;
+        Ok(Self {
+            model,
+            dtype: *dtype,
+        })
+    }
 }
 
 impl ModelBackend for Qwen3_5Backend {

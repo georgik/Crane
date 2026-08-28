@@ -1,7 +1,7 @@
 //! Top-level Qwen 3.5 text-only transformer + the high-level `Model`
 //! wrapper used by the engine (config + weights + tokenizer).
 
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 
 use anyhow::{Context, Error as E, Result};
 use candle_core::quantized::GgmlDType;
@@ -20,6 +20,9 @@ use super::modeling::{DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm, RopeSlice};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::models::hunyuan_dense::modeling::Gguf;
+use crate::models::tensor_split::{
+    devices_equal, per_layer_devices, split_point, sync_device_stream,
+};
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;
@@ -40,6 +43,11 @@ pub struct Qwen3_5TextModel {
     /// Per-layer K/V cache; `Some` for full-attention blocks, `None` for GDN.
     attn_caches: Vec<Option<KvCache>>,
     device: Device,
+    /// Per-layer CUDA assignment for whole-layer multi-GPU splitting; every
+    /// entry equals `device` on a single-device model.
+    layer_devices: Vec<Device>,
+    /// Device the embedding table, final norm and lm_head live on (layer 0's).
+    base_device: Device,
     dtype: DType,
 }
 
@@ -131,7 +139,13 @@ impl Qwen3_5TextModel {
 
         let rotary = MRotaryEmbedding::new(&text_cfg, device)?;
 
-        let (gdn_caches, attn_caches) = build_layer_caches(&layers, &text_cfg, dtype, device)?;
+        let layer_devices = (0..text_cfg.num_hidden_layers)
+            .map(|_| device.clone())
+            .collect::<Vec<Device>>();
+        let base_device = device.clone();
+
+        let (gdn_caches, attn_caches) =
+            build_layer_caches(&layers, &text_cfg, dtype, &layer_devices)?;
 
         Ok(Self {
             cfg: text_cfg,
@@ -143,6 +157,8 @@ impl Qwen3_5TextModel {
             gdn_caches,
             attn_caches,
             device: device.clone(),
+            layer_devices,
+            base_device,
             dtype,
         })
     }
@@ -152,23 +168,24 @@ impl Qwen3_5TextModel {
     /// The model config is reconstructed entirely from GGUF metadata; the
     /// per-layer full/linear attention layout is derived from tensor presence
     /// (`blk.{i}.ssm_a` ⇒ linear) rather than trusting the interval field.
-    pub fn from_gguf<R: std::io::Read + std::io::Seek>(
+    pub fn from_gguf_inner<R: std::io::Read + std::io::Seek>(
         ct: candle_core::quantized::gguf_file::Content,
         reader: &mut R,
-        device: &Device,
+        base_device: Device,
+        layer_assign: impl Fn(usize) -> Vec<Device> + Sync,
     ) -> Result<Self> {
         // QMatMul handles quantized weights internally; dequantized side
         // tensors (norms, conv kernels, embeddings) use a compute dtype of
         // BF16 on CUDA and F16 on Metal (the F32 embedding alone would cost
         // ~1 GB at Qwen3.5's 248k vocab), F32 on CPU.
-        let dtype = if device.is_cuda() {
+        let dtype = if base_device.is_cuda() {
             DType::BF16
-        } else if device.is_metal() || device.is_rocm() {
+        } else if base_device.is_metal() || base_device.is_rocm() {
             DType::F16
         } else {
             DType::F32
         };
-        let mut gg = Gguf::new(ct, reader, device.clone(), dtype);
+        let mut gg = Gguf::new(ct, reader, base_device.clone(), dtype);
 
         let arch = gg
             .metadata()
@@ -300,10 +317,12 @@ impl Qwen3_5TextModel {
         // checkpoint; keep it in its GGUF format and gather rows on demand.
         let embed_tokens = gg.quantized_embedding("token_embd.weight", hidden_size)?;
 
+        let layer_devices = layer_assign(num_hidden_layers);
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for (idx, &layer_type) in layer_types.iter().enumerate() {
-            layers.push(DecoderLayer::from_gguf(
-                &text_cfg, layer_type, &mut gg, idx,
+            // GGUF quantized weights land directly on each layer's device.
+            layers.push(DecoderLayer::new_from_gguf(
+                &text_cfg, layer_type, &mut gg, idx, &layer_devices[idx],
             )?);
         }
 
@@ -317,8 +336,9 @@ impl Qwen3_5TextModel {
             gg.linear("output.weight")?
         };
 
-        let rotary = MRotaryEmbedding::new(&text_cfg, device)?;
-        let (gdn_caches, attn_caches) = build_layer_caches(&layers, &text_cfg, dtype, device)?;
+        let rotary = MRotaryEmbedding::new(&text_cfg, &base_device)?;
+        let (gdn_caches, attn_caches) =
+            build_layer_caches(&layers, &text_cfg, dtype, &layer_devices)?;
 
         Ok(Self {
             cfg: text_cfg,
@@ -329,9 +349,58 @@ impl Qwen3_5TextModel {
             rotary,
             gdn_caches,
             attn_caches,
-            device: device.clone(),
+            device: base_device.clone(),
+            layer_devices,
+            base_device,
             dtype,
         })
+    }
+
+    /// Load a text-only Qwen 3.5 model from a GGUF file on a single CUDA device.
+    pub fn from_gguf<R: Read + Seek>(
+        ct: candle_core::quantized::gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::from_gguf_inner(
+            ct,
+            reader,
+            device.clone(),
+            |num_layers| (0..num_layers).map(|_| device.clone()).collect::<Vec<Device>>(),
+        )
+    }
+
+    /// Load a GGUF checkpoint whose decoder is split across two CUDA devices.
+    /// Layers `[0, cut)` run on `layer_a`, the rest on `layer_b`. The per-device
+    /// ordinals come from `CRANE_GPU_IDS` and the split fraction from
+    /// `CRANE_GPU_SPLIT` (see [`crate::models::tensor_split`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `CRANE_GPU_SPLIT` is set but not a valid `g0:g1`
+    /// ratio.
+    pub fn from_gguf_split<R: Read + Seek>(
+        ct: candle_core::quantized::gguf_file::Content,
+        reader: &mut R,
+        layer_a: Device,
+        layer_b: Device,
+    ) -> Result<Self> {
+        // Layer 0's side also carries the embedding table and lm_head
+        // (~0.7 GiB on a 9B model), so a balanced layer split still leaves
+        // more VRAM used on `layer_a`; `CRANE_GPU_SPLIT` shifts the cut.
+        let gpu0_frac = match std::env::var("CRANE_GPU_SPLIT") {
+            Ok(raw) => crate::models::tensor_split::parse_split_ratio(&raw)?,
+            Err(_) => crate::models::tensor_split::DEFAULT_SPLIT_RATIO,
+        };
+        Self::from_gguf_inner(
+            ct,
+            reader,
+            layer_a.clone(),
+            |num_layers| {
+                let cut = split_point(num_layers, gpu0_frac);
+                per_layer_devices(&layer_a, &layer_b, num_layers, cut)
+            },
+        )
     }
 
     pub fn config(&self) -> &TextConfig {
@@ -414,12 +483,9 @@ impl Qwen3_5TextModel {
         let xs = timed(Span::Embed, || self.embed_tokens.forward(input_ids))?;
 
         let (cos, sin) = self.rotary.cos_sin(start_pos, seq_len)?;
-        let rope = RopeSlice {
-            cos: &cos,
-            sin: &sin,
-            rot_dim: self.rotary.rot_dim(),
-        };
-        self.run_layers(xs, rope, attention_mask)
+        // Own the mask so run_layers can relocate it across devices per layer.
+        let mask_owned = attention_mask.map(|m| m.clone());
+        self.run_layers(xs, cos, sin, self.rotary.rot_dim(), mask_owned)
     }
 
     /// Forward pass with **pre-computed hidden states** (vision path).
@@ -459,13 +525,14 @@ impl Qwen3_5TextModel {
         };
 
         let (cos, sin) = self.rotary.cos_sin_with_position_ids(position_ids)?;
-        let rope = RopeSlice {
-            cos: &cos,
-            sin: &sin,
-            rot_dim: self.rotary.rot_dim(),
-        };
 
-        let xs = self.run_layers(hidden_states.clone(), rope, mask.as_ref())?;
+        let xs = self.run_layers(
+            hidden_states.clone(),
+            cos,
+            sin,
+            self.rotary.rot_dim(),
+            mask,
+        )?;
         let s = xs.dim(1)?;
         let last = xs.narrow(1, s - 1, 1)?.contiguous()?;
         self.head(&last)
@@ -476,15 +543,38 @@ impl Qwen3_5TextModel {
     fn run_layers(
         &mut self,
         mut xs: Tensor,
-        rope: RopeSlice<'_>,
-        attention_mask: Option<&Tensor>,
+        mut cos: Tensor,
+        mut sin: Tensor,
+        rot_dim: usize,
+        mut attention_mask: Option<Tensor>,
     ) -> Result<Tensor> {
         let debug = std::env::var_os("CRANE_QWEN35_DEBUG_LAYERS").is_some();
         for i in 0..self.layers.len() {
+            // Whole-layer multi-GPU splitting: each layer's weights live on its
+            // own device (see [`crate::models::tensor_split`]), so move the
+            // activations and RoPE onto it before stepping. On a single-device
+            // model every target equals `xs.device()` and this is a no-op.
+            let target = &self.layer_devices[i];
+            if !devices_equal(xs.device(), target) {
+                // candle's cross-device copy is only ordered on the destination
+                // stream — drain the source stream so this layer's inputs are
+                // actually written before the copy reads them (see
+                // [`crate::models::tensor_split::sync_device_stream`]).
+                sync_device_stream(xs.device())?;
+                xs = xs.to_device(target)?;
+                cos = cos.to_device(target)?;
+                sin = sin.to_device(target)?;
+                attention_mask = Self::attention_map_to_device(attention_mask, target)?;
+            }
+            let rope = RopeSlice {
+                cos: &cos,
+                sin: &sin,
+                rot_dim,
+            };
             let layer = &self.layers[i];
             let gdn_slot = self.gdn_caches[i].as_mut();
             let attn_slot = self.attn_caches[i].as_mut();
-            xs = layer.forward(&xs, rope, attention_mask, gdn_slot, attn_slot)?;
+            xs = layer.forward(&xs, rope, attention_mask.as_ref(), gdn_slot, attn_slot)?;
             if debug {
                 let last = xs
                     .narrow(1, xs.dim(1)? - 1, 1)?
@@ -502,7 +592,26 @@ impl Qwen3_5TextModel {
                 );
             }
         }
+        // The final norm + `lm_head` live on the base device, so pull the last
+        // hidden states back there when layers ran elsewhere.
+        if !devices_equal(xs.device(), &self.base_device) {
+            sync_device_stream(xs.device())?;
+            xs = xs.to_device(&self.base_device)?;
+        }
         Ok(xs)
+    }
+
+    /// Move an owned attention mask onto `target`, returning `None` when the
+    /// input mask is already absent. Used to relocate the causal/broadcast
+    /// mask onto a layer's device during whole-layer multi-GPU splits.
+    fn attention_map_to_device(
+        mask: Option<Tensor>,
+        target: &Device,
+    ) -> Result<Option<Tensor>> {
+        match mask {
+            Some(m) => Ok(Some(m.clone().to_device(target)?)),
+            None => Ok(None),
+        }
     }
 
     /// Final norm + `lm_head` over a single position `[B, 1, hidden_size]`,
@@ -528,7 +637,7 @@ fn build_layer_caches(
     layers: &[DecoderLayer],
     cfg: &TextConfig,
     dtype: DType,
-    device: &Device,
+    layer_devices: &[Device],
 ) -> Result<(
     Vec<Option<crate::ops::gdn::GdnLayerCache>>,
     Vec<Option<KvCache>>,
@@ -536,10 +645,13 @@ fn build_layer_caches(
     let kv_kind = KvCacheKind::from_env();
     let mut gdn_caches = Vec::with_capacity(layers.len());
     let mut attn_caches = Vec::with_capacity(layers.len());
-    for layer in layers {
+    for (i, layer) in layers.iter().enumerate() {
         if layer.is_linear() {
+            // The GDN cache's pre-allocated state tensors must live on the same
+            // device as that layer's weights; full-attention caches are device
+            // agnostic until they fill.
             gdn_caches.push(Some(crate::ops::gdn::GdnLayerCache::new(
-                cfg, dtype, device,
+                cfg, dtype, &layer_devices[i],
             )?));
             attn_caches.push(None);
         } else {
@@ -755,6 +867,84 @@ impl Model {
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
+            dtype,
+            eos_token_ids,
+            inner,
+        })
+    }
+
+    /// Load from a `.gguf` file whose decoder is split across two CUDA devices.
+    /// Layers are partitioned by [`crate::models::tensor_split`] (`CRANE_GPU_IDS`
+    /// + `CRANE_GPU_SPLIT`) so whole layers — weights and their per-layer K/V or
+    /// GDN caches — live on GPU 0 vs GPU 1, and activations are copied at each
+    /// layer boundary. Bit-exact versus the single-device path: only whole layers
+    /// move, nothing is sharded inside a layer.
+    pub fn from_gguf_split(
+        model_path: &str,
+        layer_a: Device,
+        layer_b: Device,
+    ) -> Result<Self> {
+        use crate::utils::tokenizer_utils::{
+            build_tokenizer_from_gguf_path, gguf_has_embedded_tokenizer,
+        };
+
+        let gguf_path = std::path::Path::new(model_path);
+        let parent = gguf_path.parent().unwrap_or(gguf_path);
+
+        // The GGUF bytes are read once; the two-device loader maps each layer's
+        // tensors to its device as it walks the file.
+        let mut file = std::fs::File::open(gguf_path)
+            .with_context(|| format!("open GGUF file {model_path}"))?;
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+        eprintln!(
+            "[qwen3_5] GGUF loaded: {} tensors, {} metadata entries (split across 2 devices)",
+            ct.tensor_infos.len(),
+            ct.metadata.len()
+        );
+
+        let tokenizer = if gguf_has_embedded_tokenizer(&ct) {
+            build_tokenizer_from_gguf_path(gguf_path)?.ok_or_else(|| {
+                anyhow::anyhow!("GGUF reports embedded tokenizer but build returned None")
+            })?
+        } else {
+            let tokenizer_path = parent.join("tokenizer.json");
+            if !tokenizer_path.exists() {
+                anyhow::bail!(
+                    "GGUF lacks `tokenizer.ggml.tokens`/`merges` metadata and no sibling \
+                     tokenizer.json was found at {}. Re-export the model with a current \
+                     llama.cpp to get the embedded tokenizer.",
+                    tokenizer_path.display()
+                );
+            }
+            eprintln!(
+                "[qwen3_5] GGUF has no embedded tokenizer; falling back to {}",
+                tokenizer_path.display()
+            );
+            Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?
+        };
+
+        let mut eos_token_ids = read_eos_token_ids(&parent.to_string_lossy());
+        if eos_token_ids.is_empty()
+            && let Some(id) = ct
+                .metadata
+                .get("tokenizer.ggml.eos_token_id")
+                .and_then(|v| v.to_u32().ok())
+        {
+            eos_token_ids.push(id);
+        }
+        merge_canonical_eos_ids(&mut eos_token_ids, &tokenizer.get_vocab(true));
+
+        let inner = Qwen3_5TextModel::from_gguf_split(
+            ct,
+            &mut file,
+            layer_a.clone(),
+            layer_b,
+        )?;
+        let dtype = inner.dtype();
+
+        Ok(Self {
+            tokenizer: TokenOutputStream::new(tokenizer),
+            device: layer_a.clone(),
             dtype,
             eos_token_ids,
             inner,
