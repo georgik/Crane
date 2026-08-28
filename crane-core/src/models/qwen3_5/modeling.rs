@@ -410,6 +410,44 @@ impl FullAttention {
         })
     }
 
+    /// [`Self::from_gguf`] variant that loads every projection and norm onto an
+    /// explicit device. Used by the per-layer multi-GPU path so a block's
+    /// weights land directly on its assigned GPU.
+    pub fn from_gguf_on<R: Read + Seek>(
+        cfg: &TextConfig,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let q_proj = gg.linear_on(&format!("{prefix}.attn_q.weight"), dev)?;
+        let k_proj = gg.linear_on(&format!("{prefix}.attn_k.weight"), dev)?;
+        let v_proj = gg.linear_on(&format!("{prefix}.attn_v.weight"), dev)?;
+        let o_proj = gg.linear_on(&format!("{prefix}.attn_output.weight"), dev)?;
+
+        let q_norm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor_on(&format!("{prefix}.attn_q_norm.weight"), dev)?,
+            cfg.rms_norm_eps,
+        );
+        let k_norm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor_on(&format!("{prefix}.attn_k_norm.weight"), dev)?,
+            cfg.rms_norm_eps,
+        );
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            has_output_gate: cfg.attn_output_gate,
+        })
+    }
+
     pub fn forward(
         &self,
         x: &Tensor,
@@ -619,6 +657,25 @@ impl Mlp {
         })
     }
 
+    /// [`Self::from_gguf`] variant that loads every linear layer onto an explicit
+    /// device. Used by the per-layer multi-GPU path so each block's weights land
+    /// directly on its assigned GPU.
+    pub fn from_gguf_on<R: Read + Seek>(
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let gate_proj = gg.linear_on(&format!("{prefix}.ffn_gate.weight"), dev)?;
+        let up_proj = gg.linear_on(&format!("{prefix}.ffn_up.weight"), dev)?;
+        let down_proj = gg.linear_on(&format!("{prefix}.ffn_down.weight"), dev)?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = candle_nn::ops::silu(&self.gate_proj.forward(x)?)?;
         let up = self.up_proj.forward(x)?;
@@ -752,6 +809,85 @@ impl DecoderLayer {
                     cfg.rms_norm_eps,
                 );
                 let out_proj = gg.linear(&format!("{prefix}.ssm_out.weight"))?;
+                let gdn = GatedDeltaNet::with_derived(
+                    input_proj,
+                    conv1d_weight,
+                    dt_bias,
+                    a_log,
+                    norm,
+                    out_proj,
+                    &dims,
+                )?;
+                (LayerImpl::LinearAttention(gdn), Some(dims))
+            },
+        };
+
+        Ok(Self {
+            layer_impl,
+            input_layernorm,
+            post_attention_layernorm,
+            mlp,
+            gdn_dims,
+        })
+    }
+
+    /// [`Self::from_gguf`] variant that loads every tensor of the block onto an
+    /// explicit device. Used by the per-layer multi-GPU path so each layer's
+    /// weights land directly on its assigned GPU (full-attention and GDN alike).
+    pub fn new_from_gguf<R: Read + Seek>(
+        cfg: &TextConfig,
+        layer_type: LayerType,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let input_layernorm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor_on(&format!("{prefix}.attn_norm.weight"), dev)?,
+            cfg.rms_norm_eps,
+        );
+        let post_attention_layernorm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor_on(&format!("{prefix}.post_attention_norm.weight"), dev)?,
+            cfg.rms_norm_eps,
+        );
+        let mlp = Mlp::from_gguf_on(gg, layer_idx, dev)?;
+
+        let (layer_impl, gdn_dims) = match layer_type {
+            LayerType::FullAttention => (
+                LayerImpl::FullAttention(FullAttention::from_gguf_on(cfg, gg, layer_idx, dev)?),
+                None,
+            ),
+            LayerType::LinearAttention => {
+                let dims = GdnDims::new(cfg).with_v_head_order(VHeadOrder::Chunked);
+                let in_proj_b = LinearLayer::Standard(candle_nn::Linear::new(
+                    gg.dequant_tensor_on(&format!("{prefix}.ssm_beta.weight"), dev)?,
+                    None,
+                ));
+                let in_proj_a = LinearLayer::Standard(candle_nn::Linear::new(
+                    gg.dequant_tensor_on(&format!("{prefix}.ssm_alpha.weight"), dev)?,
+                    None,
+                ));
+                let input_proj = GdnInputProjection::Split {
+                    in_proj_qkv: gg.linear_on(&format!("{prefix}.attn_qkv.weight"), dev)?,
+                    in_proj_z: gg.linear_on(&format!("{prefix}.attn_gate.weight"), dev)?,
+                    in_proj_b,
+                    in_proj_a,
+                };
+                // GGUF stores the conv kernel 2-D; crane expects HF's
+                // `[conv_dim, 1, kernel]`.
+                let conv1d_weight = gg
+                    .dequant_tensor_on(&format!("{prefix}.ssm_conv1d.weight"), dev)?
+                    .unsqueeze(1)?;
+                let dt_bias = gg.dequant_tensor_on(&format!("{prefix}.ssm_dt.bias"), dev)?;
+                let a_log = gg
+                    .dequant_tensor_on(&format!("{prefix}.ssm_a"), dev)?
+                    .neg()?
+                    .log()?;
+                let norm = RmsNormGated::from_weight(
+                    gg.dequant_tensor_on(&format!("{prefix}.ssm_norm.weight"), dev)?,
+                    cfg.rms_norm_eps,
+                );
+                let out_proj = gg.linear_on(&format!("{prefix}.ssm_out.weight"), dev)?;
                 let gdn = GatedDeltaNet::with_derived(
                     input_proj,
                     conv1d_weight,
