@@ -20,6 +20,7 @@ use candle_nn::VarBuilder;
 use std::io::{Read, Seek};
 
 use crate::models::hunyuan_dense::modeling::Gguf;
+use crate::models::qwen3_5::moe::MoExperts;
 use crate::ops::linear::{LinearLayer, linear_layer};
 
 // ── Qwen 3.5 RMSNorm (unit-offset) ───────────────────────────────────────
@@ -491,7 +492,7 @@ impl FullAttention {
     /// Returns an error if the forward pass fails.
     // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key, value,
     // batch, heads, seq_len, head_dim), matching the terminology used
-    throughout this function's comments.
+    // throughout this function's comments.
     #[allow(clippy::many_single_char_names)]
     pub fn forward(
         &self,
@@ -711,14 +712,10 @@ impl Mlp {
         dev: &Device,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
-        let gate_proj = gg.linear_on(&format!("{prefix}.ffn_gate.weight"), dev)?;
-        let up_proj = gg.linear_on(&format!("{prefix}.ffn_up.weight"), dev)?;
-        let down_proj = gg.linear_on(&format!("{prefix}.ffn_down.weight"), dev)?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
+        let gate = gg.linear_on(&format!("{prefix}.ffn_gate.weight"), dev)?;
+        let up = gg.linear_on(&format!("{prefix}.ffn_up.weight"), dev)?;
+        let down = gg.linear_on(&format!("{prefix}.ffn_down.weight"), dev)?;
+        Ok(Self { gate, up, down })
     }
 
     /// # Errors
@@ -743,7 +740,11 @@ pub struct DecoderLayer {
     layer_impl: LayerImpl,
     input_layernorm: Qwen35RmsNorm,
     post_attention_layernorm: Qwen35RmsNorm,
-    mlp: Mlp,
+    /// Dense MLP; skipped for MoE checkpoints, which route through [`MoExperts`]
+    /// instead (a MoE checkpoint has no `blk.N.ffn_gate.weight` tensors).
+    mlp: Option<Mlp>,
+    /// MoE experts; `None` for dense checkpoints (`num_experts == 0`).
+    mo_experts: Option<MoExperts>,
     /// Pre-computed dims for the GDN path. `None` for full-attention blocks.
     gdn_dims: Option<GdnDims>,
 }
@@ -757,12 +758,18 @@ impl DecoderLayer {
     /// # Errors
     ///
     /// Returns an error if a required weight tensor is missing or has an unexpected shape.
+    /// Bails for MoE checkpoints: the GGUF path is the only supported MoE loader.
     pub fn load(
         cfg: &TextConfig,
         layer_type: LayerType,
         vb: VarBuilder,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
+        if cfg.is_moe() {
+            candle_core::bail!(
+                "[qwen3_5] MoE checkpoints (num_experts > 0) are supported from GGUF only"
+            );
+        }
         let input_layernorm =
             Qwen35RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, &vb.pp("input_layernorm"))?;
         let post_attention_layernorm = Qwen35RmsNorm::load(
@@ -770,7 +777,8 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             &vb.pp("post_attention_layernorm"),
         )?;
-        let mlp = Mlp::load(cfg, &vb.pp("mlp"), quant)?;
+        let mlp = Some(Mlp::load(cfg, &vb.pp("mlp"), quant)?);
+        let mo_experts = None;
 
         let (layer_impl, gdn_dims) = match layer_type {
             LayerType::FullAttention => (
@@ -789,6 +797,7 @@ impl DecoderLayer {
             input_layernorm,
             post_attention_layernorm,
             mlp,
+            mo_experts,
             gdn_dims,
         })
     }
@@ -826,7 +835,17 @@ impl DecoderLayer {
             gg.dequant_tensor(&format!("{prefix}.post_attention_norm.weight"))?,
             cfg.rms_norm_eps,
         );
-        let mlp = Mlp::from_gguf(gg, layer_idx)?;
+        let mlp = if cfg.is_moe() {
+            None
+        } else {
+            Some(Mlp::from_gguf(gg, layer_idx)?)
+        };
+        let mo_experts = if cfg.is_moe() {
+            let dev = gg.device().clone();
+            Some(MoExperts::from_gguf_on(gg, cfg, layer_idx, &dev, gg.dtype())?)
+        } else {
+            None
+        };
 
         let (layer_impl, gdn_dims) = match layer_type {
             LayerType::FullAttention => (
@@ -882,6 +901,7 @@ impl DecoderLayer {
             input_layernorm,
             post_attention_layernorm,
             mlp,
+            mo_experts,
             gdn_dims,
         })
     }
@@ -905,7 +925,16 @@ impl DecoderLayer {
             gg.dequant_tensor_on(&format!("{prefix}.post_attention_norm.weight"), dev)?,
             cfg.rms_norm_eps,
         );
-        let mlp = Mlp::from_gguf_on(gg, layer_idx, dev)?;
+        let mlp = if cfg.is_moe() {
+            None
+        } else {
+            Some(Mlp::from_gguf_on(gg, layer_idx, dev)?)
+        };
+        let mo_experts = if cfg.is_moe() {
+            Some(MoExperts::from_gguf_on(gg, cfg, layer_idx, dev, gg.dtype())?)
+        } else {
+            None
+        };
 
         let (layer_impl, gdn_dims) = match layer_type {
             LayerType::FullAttention => (
@@ -961,6 +990,7 @@ impl DecoderLayer {
             input_layernorm,
             post_attention_layernorm,
             mlp,
+            mo_experts,
             gdn_dims,
         })
     }
@@ -1022,7 +1052,15 @@ impl DecoderLayer {
             self.post_attention_layernorm.forward(&x)
         })?;
 
-        let mlp_out = timed(Span::Mlp, || self.mlp.forward(&normed2))?;
+        let mlp_out = if let Some(mo) = &self.mo_experts {
+            timed(Span::Mlp, || mo.forward(&normed2))?
+        } else {
+            let mlp = self
+                .mlp
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("layer has no dense MLP and no MoE experts".into()))?;
+            timed(Span::Mlp, || mlp.forward(&normed2))?
+        };
 
         timed(Span::Resid, || residual2 + mlp_out)
     }

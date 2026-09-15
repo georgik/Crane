@@ -15,6 +15,7 @@ use std::sync::Arc;
 /// quantized QMatMul. Both implement Module::forward identically from the
 /// caller's perspective. This allows the same model code to serve both
 /// safetensors and GGUF weights with zero duplication.
+#[derive(Clone)]
 pub enum LinearLayer {
     Standard(Linear),
     Quantized(QMatMul),

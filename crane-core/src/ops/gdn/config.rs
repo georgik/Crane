@@ -154,6 +154,13 @@ pub mod defaults {
     pub fn shared_expert_intermediate_size() -> usize {
         0
     }
+
+    /// Whether to normalize the top-k router probs so they sum to one. Absent
+    /// in dense checkpoints (no MoE path); Ornith sets it from the checkpoint.
+    /// Standard Qwen3-next gated-MoE uses `false`.
+    pub fn norm_topk_prob() -> bool {
+        false
+    }
 }
 
 /// Marker type used by model configs that deserialize nested blocks with

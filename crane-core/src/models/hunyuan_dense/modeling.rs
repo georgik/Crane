@@ -36,6 +36,16 @@ impl<R: Read + Seek> Gguf<R> {
         }
     }
 
+    /// The device every default-path tensor is loaded onto.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// The compute dtype used for dequantized side tensors.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
     /// Load a quantized tensor and wrap as a `LinearLayer` (`QMatMul`).
     ///
     /// # Errors

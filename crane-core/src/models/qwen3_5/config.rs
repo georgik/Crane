@@ -80,6 +80,11 @@ pub struct TextConfig {
     #[serde(default = "defaults::shared_expert_intermediate_size")]
     pub shared_expert_intermediate_size: usize,
 
+    /// Whether to normalize the top-k router probs so they sum to one. Absent
+    /// in dense checkpoints (no MoE path); Ornith sets it from the checkpoint.
+    #[serde(default = "defaults::norm_topk_prob")]
+    pub norm_topk_prob: bool,
+
     #[serde(default)]
     pub tie_word_embeddings: bool,
 
@@ -220,6 +225,13 @@ impl TextConfig {
             );
         }
         Ok(())
+    }
+
+    /// Whether this checkpoint uses the mixture-of-experts path. Dense checkpoints
+    /// leave `num_experts == 0`, so the decoder stays a plain dense MLP.
+    #[must_use]
+    pub fn is_moe(&self) -> bool {
+        self.num_experts > 0
     }
 
     #[must_use]

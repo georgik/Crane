@@ -55,6 +55,7 @@ pub const DEFAULT_SPLIT_RATIO: f32 = 0.5;
 /// # Errors
 ///
 /// Returns an error if the CUDA stream cannot be synchronized.
+#[cfg(feature = "cuda")]
 pub fn sync_device_stream(device: &Device) -> Result<()> {
     match device {
         Device::Cuda(d) => {
@@ -64,6 +65,12 @@ pub fn sync_device_stream(device: &Device) -> Result<()> {
         },
         _ => Ok(()),
     }
+}
+
+/// Non-CUDA builds never cross device boundaries, so this is a no-op.
+#[cfg(not(feature = "cuda"))]
+pub fn sync_device_stream(_device: &Device) -> Result<()> {
+    Ok(())
 }
 
 /// Parse a `g0:g1` device-id pair into CUDA ordinals, validating that exactly

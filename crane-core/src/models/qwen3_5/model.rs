@@ -226,7 +226,20 @@ impl Qwen3_5TextModel {
 
         let head_dim = md_u32(&gg, "attention.key_length")?;
         let hidden_size = md_u32(&gg, "embedding_length")?;
-        let num_hidden_layers = md_u32(&gg, "block_count")?;
+        let block_count = md_u32(&gg, "block_count")?;
+        // Multi-token-prediction ("nextn") checkpoints append their draft block
+        // after the real decoder stack, and `block_count` includes it (e.g.
+        // Ornith-1.5-35B: 40 decoder layers + 1 nextn block = 41). The draft
+        // block is driven by `eh_proj` over a (hidden, embedding) pair rather
+        // than the plain residual stream, so it must not run as decoder layer
+        // `block_count - 1`.
+        let num_hidden_layers = if md_u32_or(&gg, "nextn_predict_layers", 0) > 0
+            && gg.contains_tensor(&format!("blk.{}.nextn.eh_proj.weight", block_count - 1))
+        {
+            block_count - 1
+        } else {
+            block_count
+        };
         let rms_norm_eps = gg
             .metadata()
             .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
@@ -295,7 +308,14 @@ impl Qwen3_5TextModel {
             head_dim,
             vocab_size,
             hidden_size,
-            intermediate_size: md_u32(&gg, "feed_forward_length")?,
+            // `feed_forward_length` is omitted on MoE checkpoints; the shared-expert
+            // weights (`blk.N.mlp.gate/up/down_proj`) that the dense MLP loads still
+            // define this dim, so fall back to `expert_shared_feed_forward_length`.
+            intermediate_size: md_u32_or(
+                &gg,
+                "feed_forward_length",
+                md_u32_or(&gg, "expert_shared_feed_forward_length", 0),
+            ),
             num_hidden_layers,
             num_attention_heads: md_u32(&gg, "attention.head_count")?,
             num_key_value_heads: md_u32(&gg, "attention.head_count_kv")?,
@@ -316,12 +336,13 @@ impl Qwen3_5TextModel {
             linear_num_value_heads: num_v_heads,
             // Present only in MoE checkpoints (Ornith / Qwen3_5-MoE); dense
             // qwen3_5/6/8 leave these absent → 0 → block stays a plain MLP.
-            num_experts: md_u32_or(&gg, &format!("{arch}.expert_count"), 0),
-            num_experts_per_tok: md_u32_or(&gg, &format!("{arch}.expert_used_count"), 8),
-            moe_intermediate_size: md_u32_or(&gg, &format!("{arch}.expert_feed_forward_length"), 0),
+            // `md_u32_or` already scopes keys under `{arch}`.
+            num_experts: md_u32_or(&gg, "expert_count", 0),
+            num_experts_per_tok: md_u32_or(&gg, "expert_used_count", 8),
+            moe_intermediate_size: md_u32_or(&gg, "expert_feed_forward_length", 0),
             shared_expert_intermediate_size: md_u32_or(
                 &gg,
-                &format!("{arch}.expert_shared_feed_forward_length"),
+                "expert_shared_feed_forward_length",
                 0,
             ),
             tie_word_embeddings,
@@ -329,6 +350,9 @@ impl Qwen3_5TextModel {
             // GGUF carries no gate-activation key; the conversion only ever
             // targets the swish gate this code implements.
             output_gate_type: None,
+            // Absent in dense checkpoints (no MoE path); Ornith sets it from the
+            // checkpoint. Standard Qwen3-next gated-MoE normalizes false here.
+            norm_topk_prob: true,
         };
 
         // The 248k-row table is the single largest dequantization in the

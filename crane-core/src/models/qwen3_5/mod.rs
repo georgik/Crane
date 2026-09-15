@@ -16,6 +16,7 @@ mod conv3d_temporal_2;
 mod kv_cache;
 mod model;
 mod modeling;
+mod moe;
 mod prefill;
 pub mod processor;
 pub mod vision;
@@ -27,6 +28,7 @@ pub use model::{Model, ModelFormat, Qwen3_5TextModel};
 pub use modeling::{
     DecoderLayer, FullAttention, MRotaryEmbedding, Mlp, Qwen35RmsNorm, RopeSlice, apply_mrope,
 };
+pub use moe::MoExperts;
 pub use prefill::{DEFAULT_CHUNK as DEFAULT_PREFILL_CHUNK, chunk_size as prefill_chunk_size};
 pub use processor::{PreprocessorConfig, ProcessedImage, load_preprocessor_config};
 pub use vision::Qwen3_5VisionModel;
