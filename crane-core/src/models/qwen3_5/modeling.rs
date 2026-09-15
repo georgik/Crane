@@ -608,35 +608,114 @@ impl FullAttention {
             return self.o_proj.forward(&y);
         }
 
-        let k_rep = if n_rep > 1 {
-            let (b, kv_heads, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .contiguous()?
-                .reshape((b, self.num_heads, s, d))?
-        } else {
-            k
-        };
-        let v_rep = if n_rep > 1 {
-            let (b, kv_heads, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .contiguous()?
-                .reshape((b, self.num_heads, s, d))?
-        } else {
-            v
-        };
+        // ── Prefill: GQA-grouped SDPA over query blocks ──
+        //
+        // The previous implementation expanded K/V to all `num_heads` head
+        // groups and materialized the score matrix at `[B, H, S_q, S_total]`:
+        // three O(H·S) contiguous K/V copies plus ~three score copies whose
+        // size grows linearly with the context. At a 160k context that peaks
+        // beyond 10 GiB of transients per layer and cannot fit a 16 GiB card.
+        //
+        // The same trick the decode path above uses — fold the `n_rep` query
+        // heads sharing a KV head into the matmul's row dimension — removes
+        // the K/V copies, and processing the query rows in blocks sized so a
+        // score tensor stays under ~100M elements bounds score memory to a
+        // few hundred MiB at any context length. `CRANE_ATTN_EXPAND=1`
+        // restores the legacy expansion path for A/B comparison.
 
-        let k_t = k_rep.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-        let attn_logits = (q.matmul(&k_t)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights_with_mask(&attn_logits, mask)?,
-            None => attn_logits,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let y = attn_weights.matmul(&v_rep)?;
+        if legacy_attn_expand() {
+            let k_rep = if n_rep > 1 {
+                let (b, kv_heads, s, d) = k.dims4()?;
+                k.unsqueeze(2)?
+                    .expand((b, kv_heads, n_rep, s, d))?
+                    .contiguous()?
+                    .reshape((b, self.num_heads, s, d))?
+            } else {
+                k
+            };
+            let v_rep = if n_rep > 1 {
+                let (b, kv_heads, s, d) = v.dims4()?;
+                v.unsqueeze(2)?
+                    .expand((b, kv_heads, n_rep, s, d))?
+                    .contiguous()?
+                    .reshape((b, self.num_heads, s, d))?
+            } else {
+                v
+            };
 
-        let y = y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?;
+            let k_t = k_rep.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+            let attn_logits = (q.matmul(&k_t)? * scale)?;
+            let attn_weights = match attention_mask {
+                Some(mask) => attn_weights_with_mask(&attn_logits, mask)?,
+                None => attn_logits,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let y = attn_weights.matmul(&v_rep)?;
+
+            let y = y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?;
+            let y = if let Some(g) = gate {
+                let gate = candle_nn::ops::sigmoid(&g.to_dtype(y.dtype())?)?;
+                y.broadcast_mul(&gate)?
+            } else {
+                y
+            };
+            return self.o_proj.forward(&y);
+        }
+
+        let total_k = k.dim(D::Minus2)?;
+        // Score-matrix budget: the per-block score tensor holds
+        // `b_sz * kv_heads * n_rep * rows * total_k` elements; cap that at
+        // 100M (~200 MiB in BF16) so context length only costs time, never
+        // memory. At least 8 rows per block keeps the GEMMs reasonable.
+        let rows_per_block = (100_000_000usize
+            / (b_sz * self.num_kv_heads * n_rep * total_k).max(1))
+        .max(8)
+        .min(seq_len);
+        let k_t = k.transpose(D::Minus2, D::Minus1)?; // [B, kv, D, S_total] — view only
+
+        let mut blocks: Vec<Tensor> = Vec::with_capacity(seq_len.div_ceil(rows_per_block));
+        let mut offset = 0;
+        while offset < seq_len {
+            let rows = rows_per_block.min(seq_len - offset);
+            // Head order is kv-major (head h = kv*n_rep + rep), so folding the
+            // `n_rep` query heads sharing a KV head into the matmul's row
+            // dimension is a pure reshape. K/V are read once at their stored
+            // `kv_heads` width — no expansion, no contiguous copies of K.
+            let q_g = q
+                .narrow(2, offset, rows)? // [B, H, rows, D]
+                .reshape((b_sz, self.num_kv_heads, n_rep * rows, self.head_dim))?; // [B, kv, n_rep*rows, D]
+            let logits = (q_g.matmul(&k_t)? * scale)?; // [B, kv, n_rep*rows, S_total]
+            let attn_weights = match attention_mask {
+                Some(mask) => {
+                    // Merge the mask over the folded row groups: a [rows, S]
+                    // slice becomes [1, 1, 1, rows, S] and broadcasts across
+                    // the `n_rep` query heads of each KV group.
+                    let mask = mask.narrow(2, offset, rows)?.unsqueeze(2)?;
+                    let (b, kv, grp, total) = logits.dims4()?;
+                    let grouped = logits.reshape((b, kv, n_rep, rows, total))?;
+                    attn_weights_with_mask(&grouped, &mask)?.reshape((b, kv, grp, total))?
+                },
+                None => logits,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let y_blk = attn_weights.matmul(&v)?; // [B, kv, n_rep*rows, D]
+            // Unfold back to `[B, rows, H*D]`: unmerge the folded rows, put
+            // the sequence axis before heads, flatten the kv-major head order.
+            let y_blk = y_blk
+                .reshape((b_sz, self.num_kv_heads, n_rep, rows, self.head_dim))?
+                .permute([0, 3, 1, 2, 4])?
+                .reshape((b_sz, rows, ()))?;
+            blocks.push(y_blk);
+            offset += rows;
+        }
+
+        let y = if blocks.len() == 1 {
+            blocks.pop().ok_or_else(|| {
+                candle_core::Error::Msg("prefill attention produced no output blocks".into())
+            })?
+        } else {
+            Tensor::cat(&blocks, 1)?
+        };
 
         let y = if let Some(g) = gate {
             let gate = candle_nn::ops::sigmoid(&g.to_dtype(y.dtype())?)?;

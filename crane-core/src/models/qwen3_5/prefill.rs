@@ -112,11 +112,16 @@ fn last_position(hidden: &Tensor) -> Result<Tensor> {
 /// query at absolute position `start_pos + i` and holds `-inf` for every key
 /// column beyond it.
 ///
-/// Built at exactly `seq_q × total_k`. The previous version built the whole
-/// `total_k × total_k` square and narrowed it, which both reintroduces the
-/// quadratic allocation chunking exists to avoid and silently drops
-/// `start_pos` — a chunk starting mid-prompt would get row 0's mask for its
-/// first token instead of row `start_pos`'s.
+/// Built at exactly `seq_q × total_k`, from device-side index arithmetic —
+/// materializing the table in a host `Vec<f32>` first cost a 327 MiB
+/// allocation plus a PCIe copy per chunk at a 160k context. The comparison
+/// runs in f32 (positions up to the 262k RoPE limit are exact there); BF16
+/// would round nearby column indices together and unmask future keys.
+///
+/// The earlier version built the whole `total_k × total_k` square and narrowed
+/// it, which both reintroduced the quadratic allocation chunking exists to
+/// avoid and silently dropped `start_pos` — a chunk starting mid-prompt got
+/// row 0's mask for its first token instead of row `start_pos`'s.
 pub(super) fn causal_mask(
     seq_q: usize,
     start_pos: usize,
@@ -124,13 +129,16 @@ pub(super) fn causal_mask(
     dtype: DType,
 ) -> Result<Tensor> {
     let total_k = start_pos + seq_q;
-    let mut data: Vec<f32> = Vec::with_capacity(seq_q * total_k);
-    for q in start_pos..total_k {
-        for k in 0..total_k {
-            data.push(if k > q { f32::NEG_INFINITY } else { 0.0 });
-        }
-    }
-    Ok(Tensor::from_vec(data, (seq_q, total_k), device)?
+    let cols = Tensor::arange(0u32, total_k as u32, device)?.to_dtype(DType::F32)?;
+    let rows = Tensor::arange(start_pos as u32, total_k as u32, device)?.to_dtype(DType::F32)?;
+    let future = cols
+        .unsqueeze(0)? // [1, total_k]
+        .broadcast_sub(&rows.unsqueeze(1)?)?; // [seq_q, total_k], > 0 = future key
+    let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?.broadcast_as(future.shape())?;
+    let zero = Tensor::new(0f32, device)?.broadcast_as(future.shape())?;
+    Ok(future
+        .gt(0f32)?
+        .where_cond(&neg_inf, &zero)? // [seq_q, total_k] f32
         .to_dtype(dtype)?
         .unsqueeze(0)?
         .unsqueeze(0)?)
@@ -217,6 +225,7 @@ mod tests {
                 num_experts_per_tok: 0,
                 moe_intermediate_size: 0,
                 shared_expert_intermediate_size: 0,
+                norm_topk_prob: false,
             },
             vision_config: None,
             image_token_id: None,
