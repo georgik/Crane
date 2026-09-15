@@ -47,6 +47,7 @@ use std::io::{Read, Seek};
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
 use crate::models::modules::rotary::RotaryEmbedding;
+use crate::models::tensor_split::devices_equal;
 use crate::utils::DeviceExt;
 
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
@@ -127,6 +128,25 @@ impl Config {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
+}
+
+// Multi-GPU helpers: rebuild a layer (or sub-module) whose weights already
+// exist on the base device onto another device. Quantized layers are not moved;
+// they are loaded directly on their target device via the GGUF `_on` methods.
+
+fn moved_linear_layer(layer: &LinearLayer, target: &Device) -> Result<LinearLayer> {
+    // Only Standard layers reach here (quantized ones load directly on their
+    // device); a missing weight means this layer is quantized and shouldn't move.
+    let w = layer.weight().ok_or_else(|| candle_core::Error::msg("cannot move quantized layer to another device"))?.clone();
+    let b = match layer.bias() {
+        Some(b) => Some(b.to_device(target)?),
+        None => None,
+    };
+    Ok(LinearLayer::Standard(Linear::new(w, b)))
+}
+
+fn moved_rms_norm(norm: &RmsNorm, eps: f64, target: &Device) -> Result<RmsNorm> {
+    Ok(RmsNorm::new(norm.weight().to_device(target)?, eps))
 }
 
 // ── Attention ───────────────────────────────────────────────────────────
@@ -243,16 +263,17 @@ impl Attention {
         config: &Config,
         gg: &mut Gguf<R>,
         layer_idx: usize,
+        dev: &Device,
     ) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
         let prefix = format!("blk.{layer_idx}");
 
-        let q_proj = gg.linear(&format!("{prefix}.attn_q.weight"))?;
-        let k_proj = gg.linear(&format!("{prefix}.attn_k.weight"))?;
-        let v_proj = gg.linear(&format!("{prefix}.attn_v.weight"))?;
-        let o_proj = gg.linear(&format!("{prefix}.attn_output.weight"))?;
+        let q_proj = gg.linear_on(&format!("{prefix}.attn_q.weight"), dev)?;
+        let k_proj = gg.linear_on(&format!("{prefix}.attn_k.weight"), dev)?;
+        let v_proj = gg.linear_on(&format!("{prefix}.attn_v.weight"), dev)?;
+        let o_proj = gg.linear_on(&format!("{prefix}.attn_output.weight"), dev)?;
 
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
@@ -532,6 +553,57 @@ impl Attention {
         self.o_proj.forward(&attn_output)
     }
 
+    /// Multi-GPU layer splitting: rebuild this attention onto another device.
+    /// The caller constructs layers on the base device first, then calls this
+    /// when the assigned layer's device differs — the original buffers are
+    /// dropped so no weight is retained twice (quantized projections stay put).
+    fn moved(&self, config: &Config, target: &Device) -> Result<Self> {
+        let q_proj = moved_linear_layer(&self.q_proj, target)?;
+        let k_proj = moved_linear_layer(&self.k_proj, target)?;
+        let v_proj = moved_linear_layer(&self.v_proj, target)?;
+        let o_proj = moved_linear_layer(&self.o_proj, target)?;
+
+        let qkv_proj = match (&q_proj, &k_proj, &v_proj) {
+            (LinearLayer::Standard(q), LinearLayer::Standard(k), LinearLayer::Standard(v)) => {
+                let qkv_w = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
+                let qkv_b = match (q.bias(), k.bias(), v.bias()) {
+                    (Some(a), Some(b), Some(c)) => Some(Tensor::cat(&[a, b, c], 0)?),
+                    _ => None,
+                };
+                Some(Linear::new(qkv_w, qkv_b))
+            },
+            _ => None,
+        };
+
+        let q_norm = self
+            .q_norm
+            .as_ref()
+            .map(|n| moved_rms_norm(n, config.rms_norm_eps, target))
+            .transpose()?;
+        let k_norm = self
+            .k_norm
+            .as_ref()
+            .map(|n| moved_rms_norm(n, config.rms_norm_eps, target))
+            .transpose()?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            qkv_proj,
+            q_norm,
+            k_norm,
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            q_dim: self.q_dim,
+            kv_dim: self.kv_dim,
+            kv_cache: None,
+            cache_seq_len: 0,
+        })
+    }
+
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
         self.cache_seq_len = 0;
@@ -594,15 +666,35 @@ impl Mlp {
         gg: &mut Gguf<R>,
         layer_idx: usize,
         _intermediate_size: usize,
+        dev: &Device,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
-        let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
-        let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
-        let down_proj = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
+        let gate_proj = gg.linear_on(&format!("{prefix}.ffn_gate.weight"), dev)?;
+        let up_proj = gg.linear_on(&format!("{prefix}.ffn_up.weight"), dev)?;
+        let down_proj = gg.linear_on(&format!("{prefix}.ffn_down.weight"), dev)?;
         Ok(Self {
             gate_up: MlpGateUp::Separate { gate_proj, up_proj },
             down_proj,
         })
+    }
+
+    /// Multi-GPU layer splitting: move an already-built MLP onto another device.
+    fn moved(&self, target: &Device) -> Result<Self> {
+        let down_proj = moved_linear_layer(&self.down_proj, target)?;
+        let gate_up = match &self.gate_up {
+            MlpGateUp::Merged {
+                gate_up_proj,
+                intermediate_size,
+            } => MlpGateUp::Merged {
+                gate_up_proj: Linear::new(gate_up_proj.weight().to_device(target)?, None),
+                intermediate_size: *intermediate_size,
+            },
+            MlpGateUp::Separate { gate_proj, up_proj } => MlpGateUp::Separate {
+                gate_proj: moved_linear_layer(gate_proj, target)?,
+                up_proj: moved_linear_layer(up_proj, target)?,
+            },
+        };
+        Ok(Self { gate_up, down_proj })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -679,20 +771,47 @@ impl DecoderLayer {
         config: &Config,
         gg: &mut Gguf<R>,
         layer_idx: usize,
+        dev: &Device,
     ) -> Result<Self> {
-        let self_attn = Attention::new_from_gguf(config, gg, layer_idx)?;
-        let mlp = Mlp::new_from_gguf(gg, layer_idx, config.intermediate_size)?;
+        let self_attn = Attention::new_from_gguf(config, gg, layer_idx, dev)?;
+        let mlp = Mlp::new_from_gguf(gg, layer_idx, config.intermediate_size, dev)?;
         let prefix = format!("blk.{layer_idx}");
         let input_layernorm =
-            gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
+            gg.rms_norm_on(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps, dev)?;
         let post_attention_layernorm =
-            gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
+            gg.rms_norm_on(&format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps, dev)?;
         Ok(Self {
             self_attn,
             mlp,
             input_layernorm,
             post_attention_layernorm,
         })
+    }
+
+    /// Multi-GPU layer splitting: rebuild an already-built layer onto another
+    /// device. Quantized (GGUF) layers must be loaded directly on their target
+    /// device instead; this path is used for Standard checkpoints where the
+    /// weights first load on the base device then get moved to `target`.
+    fn new_on(config: &Config, vb: VarBuilder, target: &Device) -> Result<Self> {
+        let base = vb.device().clone();
+        let dl = DecoderLayer::new(config, vb)?; // whole layer on the base device
+        if !devices_equal(target, &base) {
+            let self_attn = Attention::moved(&dl.self_attn, config, target)?;
+            let mlp = Mlp::moved(&dl.mlp, target)?;
+            let input_layernorm = moved_rms_norm(&dl.input_layernorm, config.rms_norm_eps, target)?;
+            let post_attention_layernorm = moved_rms_norm(
+                &dl.post_attention_layernorm,
+                config.rms_norm_eps,
+                target,
+            )?;
+            return Ok(Self {
+                self_attn,
+                mlp,
+                input_layernorm,
+                post_attention_layernorm,
+            });
+        }
+        Ok(dl)
     }
 
     fn forward(
@@ -730,6 +849,10 @@ pub struct Qwen3Model {
     rotary_emb: RotaryEmbedding,
     config: Config,
     dtype: DType,
+    /// Per-layer CUDA device for multi-GPU layer splitting. One entry per
+    /// transformer layer; a single-device model holds the same device here
+    /// (the forward pass's boundary checks then become no-ops).
+    layer_devices: Vec<Device>,
     /// Full-sequence post-norm hidden states from the most recent forward
     /// call — see [`Self::last_hidden_states`].
     last_hidden_states: Option<Tensor>,
@@ -743,7 +866,23 @@ impl Qwen3Model {
     /// Returns an error if a required weight tensor is missing or has an
     /// unexpected shape.
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        Self::new_inner(config, vb.pp("model"), vb)
+        let device = vb.device().clone();
+        let layer_devices = (0..config.num_hidden_layers).map(|_| device.clone()).collect();
+        Self::new_inner(config, vb.pp("model"), vb, layer_devices)
+    }
+
+    /// Construct from a checkpoint whose decoder layers are split across two
+    /// CUDA devices (`--tensor-split` / `CRANE_GPU_SPLIT`). Layers
+    /// `[0, cut)` run on `layer_a`, the rest on `layer_b`. Quantized (GGUF)
+    /// checkpoints should use [`Self::from_gguf_split`] instead; this path is
+    /// for Standard (BF16/F16/F32) weights.
+    pub fn new_split(config: &Config, vb: VarBuilder, layer_a: Device, layer_b: Device) -> Result<Self> {
+        let cut = crate::models::tensor_split::split_point(
+            config.num_hidden_layers,
+            crate::models::tensor_split::DEFAULT_SPLIT_RATIO,
+        );
+        let layer_devices = crate::models::tensor_split::per_layer_devices(&layer_a, &layer_b, config.num_hidden_layers, cut);
+        Self::new_inner(config, vb.pp("model"), vb, layer_devices)
     }
 
     /// Construct from a checkpoint where the decoder is nested under a
@@ -761,12 +900,19 @@ impl Qwen3Model {
         model_vb: VarBuilder,
         root_vb: VarBuilder,
     ) -> Result<Self> {
-        Self::new_inner(config, model_vb, root_vb)
+        let layer_devices =
+            (0..config.num_hidden_layers).map(|_| model_vb.device().clone()).collect();
+        Self::new_inner(config, model_vb, root_vb, layer_devices)
     }
 
     // See `Attention::new`'s comment on `VarBuilder` by-value.
     #[allow(clippy::needless_pass_by_value)]
-    fn new_inner(config: &Config, model_vb: VarBuilder, root_vb: VarBuilder) -> Result<Self> {
+    fn new_inner(
+        config: &Config,
+        model_vb: VarBuilder,
+        root_vb: VarBuilder,
+        layer_devices: Vec<Device>,
+    ) -> Result<Self> {
         let dtype = model_vb.dtype();
         let embed_tokens = candle_nn::embedding(
             config.vocab_size,
@@ -776,8 +922,10 @@ impl Qwen3Model {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let layers_vb = model_vb.pp("layers");
-        for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(config, layers_vb.pp(i))?);
+        for (i, target) in layer_devices.iter().enumerate() {
+            // `new_on` is a no-op move when the target equals the base device, so
+            // this serves both single-device and split-GPU construction.
+            layers.push(DecoderLayer::new_on(config, layers_vb.pp(i), target)?);
         }
 
         let norm =
@@ -808,29 +956,60 @@ impl Qwen3Model {
             rotary_emb,
             config: config.clone(),
             dtype,
+            layer_devices,
             last_hidden_states: None,
         })
     }
 
-    /// Construct from a GGUF file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a required tensor or metadata entry is missing
-    /// or has an unexpected shape.
+    /// Construct a GGUF checkpoint whose decoder layers are split across two
+    /// CUDA devices. Layers `[0, cut)` run on `layer_a`, the rest on `layer_b`.
+    pub fn from_gguf_split<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        layer_a: Device,
+        layer_b: Device,
+    ) -> Result<Self> {
+        Self::from_gguf_inner(
+            ct,
+            reader,
+            layer_a.clone(),
+            |num_layers| {
+                let cut = crate::models::tensor_split::split_point(num_layers, crate::models::tensor_split::DEFAULT_SPLIT_RATIO);
+                crate::models::tensor_split::per_layer_devices(&layer_a, &layer_b, num_layers, cut)
+            },
+        )
+    }
+
+    /// Construct a GGUF checkpoint on a single CUDA device.
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let dtype = if device.is_cuda() {
+        Self::from_gguf_inner(
+            ct,
+            reader,
+            device.clone(),
+            |num_layers| (0..num_layers).map(|_| device.clone()).collect(),
+        )
+    }
+
+    /// Shared GGUF body; `layer_devices` computes the per-layer CUDA assignment
+    /// from the layer count for both single-device and split-GPU construction.
+    pub(crate) fn from_gguf_inner<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        base_device: Device,
+        layer_devices: impl Fn(usize) -> Vec<Device> + Sync,
+    ) -> Result<Self> {
+        let dtype = if base_device.is_cuda() {
             DType::BF16
-        } else if device.is_metal() || device.is_rocm() {
+        } else if base_device.is_metal() || base_device.is_rocm() {
             DType::F16
         } else {
             DType::F32
         };
-        let mut gg = Gguf::new(ct, reader, device.clone(), dtype);
+        let mut gg = Gguf::new(ct, reader, base_device.clone(), dtype);
         let md_get = |s: &str| match gg.metadata().get(s) {
             None => candle_core::bail!("cannot find {s} in GGUF metadata"),
             Some(v) => Ok(v.clone()),
@@ -902,9 +1081,11 @@ impl Qwen3Model {
             ..config
         };
 
+        let layer_devices = layer_devices(num_hidden_layers);
         let mut layers = Vec::with_capacity(num_hidden_layers);
-        for i in 0..num_hidden_layers {
-            layers.push(DecoderLayer::new_from_gguf(&config, &mut gg, i)?);
+        for (i, target) in layer_devices.iter().enumerate() {
+            // GGUF quantized weights land directly on the layer's device.
+            layers.push(DecoderLayer::new_from_gguf(&config, &mut gg, i, target)?);
         }
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
@@ -919,7 +1100,7 @@ impl Qwen3Model {
             config.head_dim(),
             config.max_position_embeddings,
             config.rope_theta,
-            device,
+            &base_device,
         )?;
 
         Ok(Self {
@@ -930,6 +1111,7 @@ impl Qwen3Model {
             rotary_emb,
             config,
             dtype,
+            layer_devices,
             last_hidden_states: None,
         })
     }
@@ -989,15 +1171,15 @@ impl Qwen3Model {
         device: &Device,
     ) -> Result<Tensor> {
         let total_len = start_pos + seq_len;
-        let (cos, sin) = self.rotary_emb.forward(start_pos, seq_len)?;
-        let cos = cos.to_dtype(self.dtype)?;
-        let sin = sin.to_dtype(self.dtype)?;
+        let (cos0, sin0) = self.rotary_emb.forward(start_pos, seq_len)?;
+        let mut cos = cos0.to_dtype(self.dtype)?;
+        let mut sin = sin0.to_dtype(self.dtype)?;
 
         // Causal mask (only during prefill; skipped for single-token decode,
         // and for CPU/B=1 prefill, where Attention::forward's flash_attn
         // fast path masks via AttnMask::Causal instead of reading this).
         let b_sz = hidden_states.dim(0)?;
-        let attention_mask = if seq_len > 1 && !(device.is_cpu() && b_sz == 1) {
+        let mut attention_mask = if seq_len > 1 && !(device.is_cpu() && b_sz == 1) {
             let mut mask_data = vec![0f32; seq_len * total_len];
             for i in 0..seq_len {
                 for j in 0..total_len {
@@ -1017,8 +1199,24 @@ impl Qwen3Model {
         };
 
         let mut hidden_states = hidden_states;
-        for layer in &mut self.layers {
+        // Multi-GPU layer splitting: before each layer, move the activations and
+        // RoPE constants onto that layer's device (and the causal mask too). With
+        // a single-device model every comparison is false and nothing copies.
+        for (target, layer) in self.layer_devices.iter().zip(self.layers.iter_mut()) {
+            if !devices_equal(hidden_states.device(), target) {
+                hidden_states = hidden_states.to_device(target)?;
+                cos = cos.to_device(target)?;
+                sin = sin.to_device(target)?;
+                attention_mask = attention_mask.map(|m| m.clone().to_device(target)).transpose()?;
+            }
             hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+        }
+
+        // The final norm/lm_head live on the base device (layer 0's); if the last
+        // layer ran elsewhere, pull the activations back before projecting.
+        let base_device = &self.layer_devices[0];
+        if !devices_equal(hidden_states.device(), base_device) {
+            hidden_states = hidden_states.to_device(base_device)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;

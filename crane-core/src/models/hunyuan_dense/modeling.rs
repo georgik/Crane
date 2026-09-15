@@ -3,7 +3,7 @@ use crate::utils::DeviceExt;
 use candle_core::quantized::{QTensor, gguf_file};
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::rotary_emb::rope;
-use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
+use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -36,13 +36,30 @@ impl<R: Read + Seek> Gguf<R> {
         }
     }
 
+    /// The device every default-path tensor is loaded onto.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// The compute dtype used for dequantized side tensors.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
     /// Load a quantized tensor and wrap as a `LinearLayer` (`QMatMul`).
     ///
     /// # Errors
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn linear(&mut self, name: &str) -> Result<LinearLayer> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let dev = self.device.clone();
+        self.linear_on(name, &dev)
+    }
+
+    /// [`Self::linear`] variant that loads onto an explicit device. Used by the
+    /// per-layer multi-GPU path so a quantized layer lands directly on its GPU.
+    pub fn linear_on(&mut self, name: &str, dev: &Device) -> Result<LinearLayer> {
+        let ws = self.ct.tensor(&mut self.reader, name, dev)?;
         let qmm = candle_core::quantized::QMatMul::from_arc(Arc::new(ws))?;
         Ok(LinearLayer::Quantized(qmm))
     }
@@ -54,8 +71,14 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
+        let dev = self.device.clone();
+        self.rms_norm_on(name, eps, &dev)
+    }
+
+    /// [`Self::rms_norm`] variant that loads onto an explicit device.
+    pub fn rms_norm_on(&mut self, name: &str, eps: f64, dev: &Device) -> Result<RmsNorm> {
+        let ws = self.ct.tensor(&mut self.reader, name, dev)?;
+        let weight = ws.dequantize(dev)?.to_dtype(self.dtype)?;
         Ok(RmsNorm::new(weight, eps))
     }
 
@@ -73,7 +96,18 @@ impl<R: Read + Seek> Gguf<R> {
         name: &str,
         hidden_size: usize,
     ) -> Result<crate::models::modules::embedding::EmbeddingLayer> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let dev = self.device.clone();
+        self.quantized_embedding_on(name, hidden_size, &dev)
+    }
+
+    /// [`Self::quantized_embedding`] variant that loads onto an explicit device.
+    pub fn quantized_embedding_on(
+        &mut self,
+        name: &str,
+        hidden_size: usize,
+        dev: &Device,
+    ) -> Result<crate::models::modules::embedding::EmbeddingLayer> {
+        let ws = self.ct.tensor(&mut self.reader, name, dev)?;
         crate::models::modules::embedding::EmbeddingLayer::from_qtensor(ws, hidden_size, self.dtype)
     }
 
@@ -85,9 +119,20 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn embedding(&mut self, name: &str, hidden_size: usize) -> Result<candle_nn::Embedding> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
-        Ok(candle_nn::Embedding::new(weight, hidden_size))
+        let dev = self.device.clone();
+        self.embedding_on(name, hidden_size, &dev)
+    }
+
+    /// [`Self::embedding`] variant that loads onto an explicit device.
+    pub fn embedding_on(
+        &mut self,
+        name: &str,
+        hidden_size: usize,
+        dev: &Device,
+    ) -> Result<Embedding> {
+        let ws = self.ct.tensor(&mut self.reader, name, dev)?;
+        let weight = ws.dequantize(dev)?.to_dtype(self.dtype)?;
+        Ok(Embedding::new(weight, hidden_size))
     }
 
     /// Load a raw `QTensor` by name.
@@ -96,7 +141,13 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing.
     pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
-        self.ct.tensor(&mut self.reader, name, &self.device)
+        let dev = self.device.clone();
+        self.tensor_on(name, &dev)
+    }
+
+    /// [`Self::tensor`] variant that loads onto an explicit device.
+    pub fn tensor_on(&mut self, name: &str, dev: &Device) -> Result<QTensor> {
+        self.ct.tensor(&mut self.reader, name, dev)
     }
 
     /// Load a tensor, dequantize, and cast to the target compute dtype.
@@ -106,8 +157,14 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn dequant_tensor(&mut self, name: &str) -> Result<Tensor> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        ws.dequantize(&self.device)?.to_dtype(self.dtype)
+        let dev = self.device.clone();
+        self.dequant_tensor_on(name, &dev)
+    }
+
+    /// [`Self::dequant_tensor`] variant that loads onto an explicit device.
+    pub fn dequant_tensor_on(&mut self, name: &str, dev: &Device) -> Result<Tensor> {
+        let ws = self.ct.tensor(&mut self.reader, name, dev)?;
+        ws.dequantize(&dev)?.to_dtype(self.dtype)
     }
 
     /// Whether the file contains a tensor with this exact name.

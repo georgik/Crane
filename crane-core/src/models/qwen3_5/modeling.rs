@@ -20,6 +20,7 @@ use candle_nn::VarBuilder;
 use std::io::{Read, Seek};
 
 use crate::models::hunyuan_dense::modeling::Gguf;
+use crate::models::qwen3_5::moe::MoExperts;
 use crate::ops::linear::{LinearLayer, linear_layer};
 
 // ── Qwen 3.5 RMSNorm (unit-offset) ───────────────────────────────────────
@@ -448,6 +449,44 @@ impl FullAttention {
         })
     }
 
+    /// [`Self::from_gguf`] variant that loads every projection and norm onto an
+    /// explicit device. Used by the per-layer multi-GPU path so a block's
+    /// weights land directly on its assigned GPU.
+    pub fn from_gguf_on<R: Read + Seek>(
+        cfg: &TextConfig,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let q_proj = gg.linear_on(&format!("{prefix}.attn_q.weight"), dev)?;
+        let k_proj = gg.linear_on(&format!("{prefix}.attn_k.weight"), dev)?;
+        let v_proj = gg.linear_on(&format!("{prefix}.attn_v.weight"), dev)?;
+        let o_proj = gg.linear_on(&format!("{prefix}.attn_output.weight"), dev)?;
+
+        let q_norm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor_on(&format!("{prefix}.attn_q_norm.weight"), dev)?,
+            cfg.rms_norm_eps,
+        );
+        let k_norm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor_on(&format!("{prefix}.attn_k_norm.weight"), dev)?,
+            cfg.rms_norm_eps,
+        );
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            has_output_gate: cfg.attn_output_gate,
+        })
+    }
+
     /// # Errors
     ///
     /// Returns an error if the forward pass fails.
@@ -569,35 +608,114 @@ impl FullAttention {
             return self.o_proj.forward(&y);
         }
 
-        let k_rep = if n_rep > 1 {
-            let (b, kv_heads, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .contiguous()?
-                .reshape((b, self.num_heads, s, d))?
-        } else {
-            k
-        };
-        let v_rep = if n_rep > 1 {
-            let (b, kv_heads, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .contiguous()?
-                .reshape((b, self.num_heads, s, d))?
-        } else {
-            v
-        };
+        // ── Prefill: GQA-grouped SDPA over query blocks ──
+        //
+        // The previous implementation expanded K/V to all `num_heads` head
+        // groups and materialized the score matrix at `[B, H, S_q, S_total]`:
+        // three O(H·S) contiguous K/V copies plus ~three score copies whose
+        // size grows linearly with the context. At a 160k context that peaks
+        // beyond 10 GiB of transients per layer and cannot fit a 16 GiB card.
+        //
+        // The same trick the decode path above uses — fold the `n_rep` query
+        // heads sharing a KV head into the matmul's row dimension — removes
+        // the K/V copies, and processing the query rows in blocks sized so a
+        // score tensor stays under ~100M elements bounds score memory to a
+        // few hundred MiB at any context length. `CRANE_ATTN_EXPAND=1`
+        // restores the legacy expansion path for A/B comparison.
 
-        let k_t = k_rep.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-        let attn_logits = (q.matmul(&k_t)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights_with_mask(&attn_logits, mask)?,
-            None => attn_logits,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let y = attn_weights.matmul(&v_rep)?;
+        if legacy_attn_expand() {
+            let k_rep = if n_rep > 1 {
+                let (b, kv_heads, s, d) = k.dims4()?;
+                k.unsqueeze(2)?
+                    .expand((b, kv_heads, n_rep, s, d))?
+                    .contiguous()?
+                    .reshape((b, self.num_heads, s, d))?
+            } else {
+                k
+            };
+            let v_rep = if n_rep > 1 {
+                let (b, kv_heads, s, d) = v.dims4()?;
+                v.unsqueeze(2)?
+                    .expand((b, kv_heads, n_rep, s, d))?
+                    .contiguous()?
+                    .reshape((b, self.num_heads, s, d))?
+            } else {
+                v
+            };
 
-        let y = y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?;
+            let k_t = k_rep.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+            let attn_logits = (q.matmul(&k_t)? * scale)?;
+            let attn_weights = match attention_mask {
+                Some(mask) => attn_weights_with_mask(&attn_logits, mask)?,
+                None => attn_logits,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let y = attn_weights.matmul(&v_rep)?;
+
+            let y = y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?;
+            let y = if let Some(g) = gate {
+                let gate = candle_nn::ops::sigmoid(&g.to_dtype(y.dtype())?)?;
+                y.broadcast_mul(&gate)?
+            } else {
+                y
+            };
+            return self.o_proj.forward(&y);
+        }
+
+        let total_k = k.dim(D::Minus2)?;
+        // Score-matrix budget: the per-block score tensor holds
+        // `b_sz * kv_heads * n_rep * rows * total_k` elements; cap that at
+        // 100M (~200 MiB in BF16) so context length only costs time, never
+        // memory. At least 8 rows per block keeps the GEMMs reasonable.
+        let rows_per_block = (100_000_000usize
+            / (b_sz * self.num_kv_heads * n_rep * total_k).max(1))
+        .max(8)
+        .min(seq_len);
+        let k_t = k.transpose(D::Minus2, D::Minus1)?; // [B, kv, D, S_total] — view only
+
+        let mut blocks: Vec<Tensor> = Vec::with_capacity(seq_len.div_ceil(rows_per_block));
+        let mut offset = 0;
+        while offset < seq_len {
+            let rows = rows_per_block.min(seq_len - offset);
+            // Head order is kv-major (head h = kv*n_rep + rep), so folding the
+            // `n_rep` query heads sharing a KV head into the matmul's row
+            // dimension is a pure reshape. K/V are read once at their stored
+            // `kv_heads` width — no expansion, no contiguous copies of K.
+            let q_g = q
+                .narrow(2, offset, rows)? // [B, H, rows, D]
+                .reshape((b_sz, self.num_kv_heads, n_rep * rows, self.head_dim))?; // [B, kv, n_rep*rows, D]
+            let logits = (q_g.matmul(&k_t)? * scale)?; // [B, kv, n_rep*rows, S_total]
+            let attn_weights = match attention_mask {
+                Some(mask) => {
+                    // Merge the mask over the folded row groups: a [rows, S]
+                    // slice becomes [1, 1, 1, rows, S] and broadcasts across
+                    // the `n_rep` query heads of each KV group.
+                    let mask = mask.narrow(2, offset, rows)?.unsqueeze(2)?;
+                    let (b, kv, grp, total) = logits.dims4()?;
+                    let grouped = logits.reshape((b, kv, n_rep, rows, total))?;
+                    attn_weights_with_mask(&grouped, &mask)?.reshape((b, kv, grp, total))?
+                },
+                None => logits,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let y_blk = attn_weights.matmul(&v)?; // [B, kv, n_rep*rows, D]
+            // Unfold back to `[B, rows, H*D]`: unmerge the folded rows, put
+            // the sequence axis before heads, flatten the kv-major head order.
+            let y_blk = y_blk
+                .reshape((b_sz, self.num_kv_heads, n_rep, rows, self.head_dim))?
+                .permute([0, 3, 1, 2, 4])?
+                .reshape((b_sz, rows, ()))?;
+            blocks.push(y_blk);
+            offset += rows;
+        }
+
+        let y = if blocks.len() == 1 {
+            blocks.pop().ok_or_else(|| {
+                candle_core::Error::Msg("prefill attention produced no output blocks".into())
+            })?
+        } else {
+            Tensor::cat(&blocks, 1)?
+        };
 
         let y = if let Some(g) = gate {
             let gate = candle_nn::ops::sigmoid(&g.to_dtype(y.dtype())?)?;
@@ -664,6 +782,21 @@ impl Mlp {
         Ok(Self { gate, up, down })
     }
 
+    /// [`Self::from_gguf`] variant that loads every linear layer onto an explicit
+    /// device. Used by the per-layer multi-GPU path so each block's weights land
+    /// directly on its assigned GPU.
+    pub fn from_gguf_on<R: Read + Seek>(
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let gate = gg.linear_on(&format!("{prefix}.ffn_gate.weight"), dev)?;
+        let up = gg.linear_on(&format!("{prefix}.ffn_up.weight"), dev)?;
+        let down = gg.linear_on(&format!("{prefix}.ffn_down.weight"), dev)?;
+        Ok(Self { gate, up, down })
+    }
+
     /// # Errors
     ///
     /// Returns an error if the underlying tensor operations fail.
@@ -686,7 +819,11 @@ pub struct DecoderLayer {
     layer_impl: LayerImpl,
     input_layernorm: Qwen35RmsNorm,
     post_attention_layernorm: Qwen35RmsNorm,
-    mlp: Mlp,
+    /// Dense MLP; skipped for MoE checkpoints, which route through [`MoExperts`]
+    /// instead (a MoE checkpoint has no `blk.N.ffn_gate.weight` tensors).
+    mlp: Option<Mlp>,
+    /// MoE experts; `None` for dense checkpoints (`num_experts == 0`).
+    mo_experts: Option<MoExperts>,
     /// Pre-computed dims for the GDN path. `None` for full-attention blocks.
     gdn_dims: Option<GdnDims>,
 }
@@ -700,12 +837,18 @@ impl DecoderLayer {
     /// # Errors
     ///
     /// Returns an error if a required weight tensor is missing or has an unexpected shape.
+    /// Bails for MoE checkpoints: the GGUF path is the only supported MoE loader.
     pub fn load(
         cfg: &TextConfig,
         layer_type: LayerType,
         vb: VarBuilder,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
+        if cfg.is_moe() {
+            candle_core::bail!(
+                "[qwen3_5] MoE checkpoints (num_experts > 0) are supported from GGUF only"
+            );
+        }
         let input_layernorm =
             Qwen35RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, &vb.pp("input_layernorm"))?;
         let post_attention_layernorm = Qwen35RmsNorm::load(
@@ -713,7 +856,8 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             &vb.pp("post_attention_layernorm"),
         )?;
-        let mlp = Mlp::load(cfg, &vb.pp("mlp"), quant)?;
+        let mlp = Some(Mlp::load(cfg, &vb.pp("mlp"), quant)?);
+        let mo_experts = None;
 
         let (layer_impl, gdn_dims) = match layer_type {
             LayerType::FullAttention => (
@@ -732,6 +876,7 @@ impl DecoderLayer {
             input_layernorm,
             post_attention_layernorm,
             mlp,
+            mo_experts,
             gdn_dims,
         })
     }
@@ -769,7 +914,17 @@ impl DecoderLayer {
             gg.dequant_tensor(&format!("{prefix}.post_attention_norm.weight"))?,
             cfg.rms_norm_eps,
         );
-        let mlp = Mlp::from_gguf(gg, layer_idx)?;
+        let mlp = if cfg.is_moe() {
+            None
+        } else {
+            Some(Mlp::from_gguf(gg, layer_idx)?)
+        };
+        let mo_experts = if cfg.is_moe() {
+            let dev = gg.device().clone();
+            Some(MoExperts::from_gguf_on(gg, cfg, layer_idx, &dev, gg.dtype())?)
+        } else {
+            None
+        };
 
         let (layer_impl, gdn_dims) = match layer_type {
             LayerType::FullAttention => (
@@ -825,6 +980,96 @@ impl DecoderLayer {
             input_layernorm,
             post_attention_layernorm,
             mlp,
+            mo_experts,
+            gdn_dims,
+        })
+    }
+
+    /// [`Self::from_gguf`] variant that loads every tensor of the block onto an
+    /// explicit device. Used by the per-layer multi-GPU path so each layer's
+    /// weights land directly on its assigned GPU (full-attention and GDN alike).
+    pub fn new_from_gguf<R: Read + Seek>(
+        cfg: &TextConfig,
+        layer_type: LayerType,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let input_layernorm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor_on(&format!("{prefix}.attn_norm.weight"), dev)?,
+            cfg.rms_norm_eps,
+        );
+        let post_attention_layernorm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor_on(&format!("{prefix}.post_attention_norm.weight"), dev)?,
+            cfg.rms_norm_eps,
+        );
+        let mlp = if cfg.is_moe() {
+            None
+        } else {
+            Some(Mlp::from_gguf_on(gg, layer_idx, dev)?)
+        };
+        let mo_experts = if cfg.is_moe() {
+            Some(MoExperts::from_gguf_on(gg, cfg, layer_idx, dev, gg.dtype())?)
+        } else {
+            None
+        };
+
+        let (layer_impl, gdn_dims) = match layer_type {
+            LayerType::FullAttention => (
+                LayerImpl::FullAttention(FullAttention::from_gguf_on(cfg, gg, layer_idx, dev)?),
+                None,
+            ),
+            LayerType::LinearAttention => {
+                let dims = GdnDims::new(cfg).with_v_head_order(VHeadOrder::Chunked);
+                let in_proj_b = LinearLayer::Standard(candle_nn::Linear::new(
+                    gg.dequant_tensor_on(&format!("{prefix}.ssm_beta.weight"), dev)?,
+                    None,
+                ));
+                let in_proj_a = LinearLayer::Standard(candle_nn::Linear::new(
+                    gg.dequant_tensor_on(&format!("{prefix}.ssm_alpha.weight"), dev)?,
+                    None,
+                ));
+                let input_proj = GdnInputProjection::Split {
+                    in_proj_qkv: gg.linear_on(&format!("{prefix}.attn_qkv.weight"), dev)?,
+                    in_proj_z: gg.linear_on(&format!("{prefix}.attn_gate.weight"), dev)?,
+                    in_proj_b,
+                    in_proj_a,
+                };
+                // GGUF stores the conv kernel 2-D; crane expects HF's
+                // `[conv_dim, 1, kernel]`.
+                let conv1d_weight = gg
+                    .dequant_tensor_on(&format!("{prefix}.ssm_conv1d.weight"), dev)?
+                    .unsqueeze(1)?;
+                let dt_bias = gg.dequant_tensor_on(&format!("{prefix}.ssm_dt.bias"), dev)?;
+                let a_log = gg
+                    .dequant_tensor_on(&format!("{prefix}.ssm_a"), dev)?
+                    .neg()?
+                    .log()?;
+                let norm = RmsNormGated::from_weight(
+                    gg.dequant_tensor_on(&format!("{prefix}.ssm_norm.weight"), dev)?,
+                    cfg.rms_norm_eps,
+                );
+                let out_proj = gg.linear_on(&format!("{prefix}.ssm_out.weight"), dev)?;
+                let gdn = GatedDeltaNet::with_derived(
+                    input_proj,
+                    conv1d_weight,
+                    dt_bias,
+                    a_log,
+                    norm,
+                    out_proj,
+                    &dims,
+                )?;
+                (LayerImpl::LinearAttention(gdn), Some(dims))
+            },
+        };
+
+        Ok(Self {
+            layer_impl,
+            input_layernorm,
+            post_attention_layernorm,
+            mlp,
+            mo_experts,
             gdn_dims,
         })
     }
@@ -886,7 +1131,15 @@ impl DecoderLayer {
             self.post_attention_layernorm.forward(&x)
         })?;
 
-        let mlp_out = timed(Span::Mlp, || self.mlp.forward(&normed2))?;
+        let mlp_out = if let Some(mo) = &self.mo_experts {
+            timed(Span::Mlp, || mo.forward(&normed2))?
+        } else {
+            let mlp = self
+                .mlp
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("layer has no dense MLP and no MoE experts".into()))?;
+            timed(Span::Mlp, || mlp.forward(&normed2))?
+        };
 
         timed(Span::Resid, || residual2 + mlp_out)
     }

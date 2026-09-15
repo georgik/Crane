@@ -433,8 +433,11 @@ fn detect_from_gguf_header(path: &Path) -> Option<ModelType> {
     match arch.as_str() {
         // llama.cpp writes "qwen35" for Qwen 3.5, 3.6 and 3.8 alike; the
         // 36/38 spellings guard against a future converter renaming it.
-        "qwen35" | "qwen3_5" | "qwen3.5" | "qwen36" | "qwen3_6" | "qwen3.6" | "qwen38"
-        | "qwen3_8" | "qwen3.8" => Some(ModelType::Qwen3_5),
+        // `qwen35moe` is the MoE variant of Qwen 3.5 (Ornith-1.5); it shares the
+        // qwen3_5 hybrid base architecture and routes through the same module, so
+        // it must sit in this arm — bare `qwen3moe` is a different backend.
+        "qwen35" | "qwen35moe" | "qwen3_5" | "qwen3.5" | "qwen36" | "qwen3_6"
+        | "qwen3.6" | "qwen38" | "qwen3_8" | "qwen3.8" => Some(ModelType::Qwen3_5),
         "qwen3" | "qwen3moe" => Some(ModelType::Qwen3),
         "qwen2" => Some(ModelType::Qwen25),
         a if a.starts_with("hunyuan") => Some(ModelType::HunyuanDense),
@@ -468,6 +471,11 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 ///
 /// `quant` requests in-situ quantization of a safetensors checkpoint (e.g.
 /// `q4k`, `q8_0`); only backends that support it accept the flag.
+///
+/// `split` names the two CUDA devices for whole-layer multi-GPU splitting
+/// (`--gpu-ids` / `CRANE_GPU_IDS`); currently supported for Qwen 3.5 GGUF
+/// checkpoints only, and rejected for everything else so a requested split
+/// never silently degrades to a single-device load.
 pub fn create_backend(
     model_type: ModelType,
     model_path: &str,
@@ -475,6 +483,7 @@ pub fn create_backend(
     dtype: &DType,
     format: ModelFormat,
     quant: Option<&str>,
+    split: Option<(&Device, &Device)>,
 ) -> Result<Box<dyn ModelBackend>> {
     let model_type = resolve(model_type, model_path);
     tracing::info!("Creating backend: {:?}", model_type);
@@ -483,6 +492,14 @@ pub fn create_backend(
         anyhow::bail!(
             "--quant (in-situ quantization) is currently only supported for qwen3_5 models; \
              for other models use a GGUF checkpoint with --format gguf"
+        );
+    }
+
+    if split.is_some() && model_type != ModelType::Qwen3_5 {
+        anyhow::bail!(
+            "multi-GPU split (--gpu-ids) is currently only supported for qwen3_5 models, \
+             got {:?}",
+            model_type
         );
     }
 
@@ -530,9 +547,25 @@ pub fn create_backend(
                 ModelFormat::Gguf => crane_core::models::qwen3_5::ModelFormat::Gguf,
                 ModelFormat::Auto => crane_core::models::qwen3_5::ModelFormat::Auto,
             };
-            Ok(Box::new(Qwen3_5Backend::new_with_options(
-                model_path, device, dtype, q35_fmt, quant,
-            )?))
+            if let Some((layer_a, layer_b)) = split {
+                // Whole-layer split reads the quantized GGUF bytes straight
+                // onto each layer's device; in-situ quantization is a
+                // safetensors-only path and cannot combine with it.
+                if quant.is_some() {
+                    anyhow::bail!(
+                        "--quant (in-situ quantization) cannot be combined with multi-GPU \
+                         split (--gpu-ids); the split path loads quantized GGUF checkpoints \
+                         directly"
+                    );
+                }
+                Ok(Box::new(Qwen3_5Backend::new_split(
+                    model_path, layer_a, layer_b, dtype,
+                )?))
+            } else {
+                Ok(Box::new(Qwen3_5Backend::new_with_options(
+                    model_path, device, dtype, q35_fmt, quant,
+                )?))
+            }
         },
         ModelType::PaddleOcrVl => {
             anyhow::bail!(
